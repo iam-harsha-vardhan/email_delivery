@@ -69,12 +69,15 @@ def decode_mime_words(s):
 
 def parse_email_message(msg):
     """Extracts all relevant details from an email message object."""
+    
+    # --- Decode Message-ID right away ---
+    decoded_message_id = decode_mime_words(msg.get("Message-ID", ""))
+    
     data = {
         "Subject": decode_mime_words(msg.get("Subject", "No Subject")),
         "Date": msg.get("Date", "No Date"),
         "SPF": "-", "DKIM": "-", "DMARC": "-", "Domain": "-",
-        "Type": "-", "Sub ID": "-", 
-        "Message-ID": msg.get("Message-ID", "") # Get raw Message-ID here
+        "Type": "-", "Sub ID": "-", "Message-ID": decoded_message_id  # Use the decoded ID
     }
 
     headers = ''.join(f"{header}: {value}\n" for header, value in msg.items())
@@ -94,36 +97,32 @@ def parse_email_message(msg):
     if dkim_match: data["DKIM"] = dkim_match.group(1).lower()
     if dmarc_match: data["DMARC"] = dmarc_match.group(1).lower()
 
-    # --- START OF UPDATED SECTION ---
-
-    # 1. Decode the Message-ID in case it's MIME encoded
-    raw_message_id = data["Message-ID"] # Get the raw ID we stored earlier
-    decoded_message_id = decode_mime_words(raw_message_id)
-    data["Message-ID"] = decoded_message_id # Overwrite with the decoded version
-
-    # 2. Use the DECODED message_id for all checks
-    if decoded_message_id:
-        # Original Sub ID logic (now uses decoded string)
-        sub_id_match = re.search(r'(GTC-[^@_]+|GMFP-[^@_]+)', decoded_message_id, re.I)
+    # --- Extract Type and Sub ID from the *decoded* Message-ID ---
+    message_id = data["Message-ID"] # Use the already decoded ID
+    if message_id:
+        
+        # --- Updated Regex to capture new Sub IDs ---
+        sub_id_match = re.search(
+            r'(GTC-[^@_]+|GMFP-[^@_]+|GRM-[^@_]+|AGM-[^@_]+|AJTC-[^@_]+)', 
+            message_id, 
+            re.I
+        )
         if sub_id_match:
             data["Sub ID"] = sub_id_match.group(1)
         
-        # Convert decoded ID to lower for new type checks
-        msg_id_lower = decoded_message_id.lower() 
-
-        # 3. Add new Type logic
-        if 'gtc' in msg_id_lower:
+        msg_id_lower = message_id.lower()
+        
+        # --- Updated Type checking logic with new conditions ---
+        if 'grm' in msg_id_lower:
+            data["Type"] = 'FPR'
+        elif 'agm' in msg_id_lower:
+            data["Type"] = 'AJ '
+        elif 'ajtc' in msg_id_lower:
+            data["Type"] = 'AJTC'
+        elif 'gtc' in msg_id_lower:
             data["Type"] = 'FPTC'
         elif 'gmfp' in msg_id_lower:
             data["Type"] = 'FP'
-        elif 'grm' in msg_id_lower:  # NEW
-            data["Type"] = 'FPR'
-        elif 'ajtc' in msg_id_lower: # NEW
-            data["Type"] = 'AJTC'
-        elif 'agm' in msg_id_lower:  # NEW
-            data["Type"] = 'AJ ' # With the space, as you requested
-            
-    # --- END OF UPDATED SECTION ---
             
     return data
 
