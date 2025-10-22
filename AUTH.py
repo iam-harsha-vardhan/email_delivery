@@ -5,7 +5,7 @@ from email.header import decode_header
 import datetime
 import re
 import pandas as pd
-import base64  # <-- Make sure this is imported
+import base64  # Make sure this is imported
 
 # --- Page Setup ---
 st.set_page_config(page_title="Email Auth Checker", layout="wide")
@@ -68,36 +68,43 @@ def decode_mime_words(s):
                 decoded_string += str(part)
     return decoded_string.strip()
 
-# --- UPDATED HELPER FUNCTION (REMOVED AJ/AGM) ---
-def extract_id_details(decoded_string, data):
-    """Helper function to populate Type and Sub ID from a string."""
-    
-    # Check if Sub ID is already found; if so, don't overwrite it
-    if not data.get("Sub ID") or data.get("Sub ID") == "-":
-        # UPDATED Regex: Removed AGM- and AJTC-
-        sub_id_match = re.search(
-            r'(GTC-[^@_]+|GMFP-[^@_]+|GRM-[^@_]+)', 
-            decoded_string, 
-            re.I
-        )
-        if sub_id_match:
-            data["Sub ID"] = sub_id_match.group(1)
+# --- *** NEW, CORRECTED HELPER FUNCTION *** ---
+def extract_id_details(search_string, data):
+    """
+    Finds the *first* matching Sub ID pattern in the search_string
+    and sets the Type *based on that specific match*.
+    """
+    # We only care about the first match we find
+    sub_id_match = re.search(
+        r'(GTC-[^@_]+|GMFP-[^@_]+|GRM-[^@_]+)', 
+        search_string, 
+        re.I
+    )
 
-    str_lower = decoded_string.lower()
-    
-    # Set Type based on keywords
-    # UPDATED logic: Removed agm and ajtc
-    if 'grm' in str_lower:
-        data["Type"] = 'FPR'
-    elif 'gtc' in str_lower:
-        data["Type"] = 'FPTC'
-    elif 'gmfp' in str_lower:
-        data["Type"] = 'FP'
-    
-    # Return True if we found a type, so we can stop searching
-    return data["Type"] != "-"
+    if sub_id_match:
+        # Get the actual matched string (e.g., "GMFP-NL-FIAIUE...")
+        matched_id_string = sub_id_match.group(1)
+        
+        # Store it as the Sub ID
+        data["Sub ID"] = matched_id_string
+        
+        # Now, set the Type based *only on this matched string*
+        id_lower = matched_id_string.lower()
+        
+        if 'grm' in id_lower:
+            data["Type"] = 'FPR'
+        elif 'gmfp' in id_lower:
+            data["Type"] = 'FP'
+        elif 'gtc' in id_lower:
+            data["Type"] = 'FPTC'
+        
+        # Return True. We found one, we are done.
+        return True
+        
+    # No match was found in this string
+    return False
 
-# --- PARSE FUNCTION (No changes needed here) ---
+# --- PARSE FUNCTION (Now uses the new helper) ---
 def parse_email_message(msg):
     """Extracts all relevant details from an email message object."""
     
@@ -127,13 +134,15 @@ def parse_email_message(msg):
     if dkim_match: data["DKIM"] = dkim_match.group(1).lower()
     if dmarc_match: data["DMARC"] = dmarc_match.group(1).lower()
 
-    # --- NEW TWO-STEP LOGIC ---
+    # --- TWO-STEP LOGIC ---
 
     # --- Step 1: Check for plain text IDs first ---
-    extract_id_details(headers_str, data)
+    # We pass the entire raw header block to the helper.
+    # The new helper will find the *first* pattern and set Type correctly.
+    found_plain_id = extract_id_details(headers_str, data)
 
     # --- Step 2: If no plain text ID was found, *then* try decoding ---
-    if data["Type"] == "-":
+    if not found_plain_id:
         # Iterate through *all* email headers to find the encoded string
         for header_name, header_value in msg.items():
             
@@ -247,7 +256,7 @@ with colB:
          with st.spinner("Fetching today's spam..."):
             spam_df = fetch_spam_emails()
             if not spam_df.empty:
-                st.session_state.spam_df = pd.concat([spam_fs, st.session_state.spam_df], ignore_index=True)
+                st.session_state.spam_df = pd.concat([spam_df, st.session_state.spam_df], ignore_index=True)
                 st.success(f"✅ Added {len(spam_df)} unique spam emails for today.")
             else:
                 st.info("No new spam emails found for today.")
