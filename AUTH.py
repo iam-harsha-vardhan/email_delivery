@@ -5,6 +5,7 @@ from email.header import decode_header
 import datetime
 import re
 import pandas as pd
+import base64  # <-- Make sure this is imported
 
 # --- Page Setup ---
 st.set_page_config(page_title="Email Auth Checker", layout="wide")
@@ -67,21 +68,51 @@ def decode_mime_words(s):
                 decoded_string += str(part)
     return decoded_string.strip()
 
+def extract_id_details(decoded_string, data):
+    """Helper function to populate Type and Sub ID from a string."""
+    
+    # Check if Sub ID is already found; if so, don't overwrite it
+    if not data.get("Sub ID") or data.get("Sub ID") == "-":
+        sub_id_match = re.search(
+            r'(GTC-[^@_]+|GMFP-[^@_]+|GRM-[^@_]+|AGM-[^@_]+|AJTC-[^@_]+)', 
+            decoded_string, 
+            re.I
+        )
+        if sub_id_match:
+            data["Sub ID"] = sub_id_match.group(1)
+
+    str_lower = decoded_string.lower()
+    
+    # Set Type based on keywords
+    if 'grm' in str_lower:
+        data["Type"] = 'FPR'
+    elif 'agm' in str_lower:
+        data["Type"] = 'AJ '
+    elif 'ajtc' in str_lower:
+        data["Type"] = 'AJTC'
+    elif 'gtc' in str_lower:
+        data["Type"] = 'FPTC'
+    elif 'gmfp' in str_lower:
+        data["Type"] = 'FP'
+    
+    # Return True if we found a type, so we can stop searching
+    return data["Type"] != "-"
+
+# --- UPDATED PARSE FUNCTION ---
 def parse_email_message(msg):
     """Extracts all relevant details from an email message object."""
-    
-    # --- Decode Message-ID right away ---
-    decoded_message_id = decode_mime_words(msg.get("Message-ID", ""))
     
     data = {
         "Subject": decode_mime_words(msg.get("Subject", "No Subject")),
         "Date": msg.get("Date", "No Date"),
         "SPF": "-", "DKIM": "-", "DMARC": "-", "Domain": "-",
-        "Type": "-", "Sub ID": "-", "Message-ID": decoded_message_id  # Use the decoded ID
+        "Type": "-", "Sub ID": "-", "Message-ID": decode_mime_words(msg.get("Message-ID", ""))
     }
 
-    headers = ''.join(f"{header}: {value}\n" for header, value in msg.items())
-    match_auth = re.search(r'Authentication-Results:.*?smtp.mailfrom=([\w\.-]+)', headers, re.I)
+    # --- Standard Header Parsing (SPF, DKIM, Domain, etc.) ---
+    headers_str = ''.join(f"{header}: {value}\n" for header, value in msg.items())
+    
+    match_auth = re.search(r'Authentication-Results:.*?smtp.mailfrom=([\w\.-]+)', headers_str, re.I)
     if match_auth:
         data["Domain"] = match_auth.group(1).lower()
     else:
@@ -90,41 +121,59 @@ def parse_email_message(msg):
         if match:
             data["Domain"] = match.group(1).lower()
 
-    spf_match = re.search(r'spf=(\w+)', headers, re.I)
-    dkim_match = re.search(r'dkim=(\w+)', headers, re.I)
-    dmarc_match = re.search(r'dmarc=(\w+)', headers, re.I)
+    spf_match = re.search(r'spf=(\w+)', headers_str, re.I)
+    dkim_match = re.search(r'dkim=(\w+)', headers_str, re.I)
+    dmarc_match = re.search(r'dmarc=(\w+)', headers_str, re.I)
     if spf_match: data["SPF"] = spf_match.group(1).lower()
     if dkim_match: data["DKIM"] = dkim_match.group(1).lower()
     if dmarc_match: data["DMARC"] = dmarc_match.group(1).lower()
 
-    # --- Extract Type and Sub ID from the *decoded* Message-ID ---
-    message_id = data["Message-ID"] # Use the already decoded ID
-    if message_id:
-        
-        # --- Updated Regex to capture new Sub IDs ---
-        sub_id_match = re.search(
-            r'(GTC-[^@_]+|GMFP-[^@_]+|GRM-[^@_]+|AGM-[^@_]+|AJTC-[^@_]+)', 
-            message_id, 
-            re.I
-        )
-        if sub_id_match:
-            data["Sub ID"] = sub_id_match.group(1)
-        
-        msg_id_lower = message_id.lower()
-        
-        # --- Updated Type checking logic with new conditions ---
-        if 'grm' in msg_id_lower:
-            data["Type"] = 'FPR'
-        elif 'agm' in msg_id_lower:
-            data["Type"] = 'AJ '
-        elif 'ajtc' in msg_id_lower:
-            data["Type"] = 'AJTC'
-        elif 'gtc' in msg_id_lower:
-            data["Type"] = 'FPTC'
-        elif 'gmfp' in msg_id_lower:
-            data["Type"] = 'FP'
+    # --- NEW TWO-STEP LOGIC ---
+
+    # --- Step 1: Check for plain text IDs first ---
+    # We pass the entire raw header block to the helper.
+    # This will find any *undecoded* IDs (like GTC-, GMFP-)
+    extract_id_details(headers_str, data)
+
+    # --- Step 2: If no plain text ID was found, *then* try decoding ---
+    if data["Type"] == "-":
+        # Iterate through *all* email headers to find the encoded string
+        for header_name, header_value in msg.items():
             
+            if not header_value:
+                continue
+            
+            # 1. Split the header value by underscores
+            parts = str(header_value).split('_')
+            
+            # 2. Try to decode each part
+            for part in parts:
+                if len(part) < 20: # Skip short parts
+                    continue
+                
+                try:
+                    # 3. Add correct Base64 padding
+                    padded_part = part + '=' * (-len(part) % 4)
+                    
+                    # 4. Decode from Base64
+                    decoded_bytes = base64.b64decode(padded_part)
+                    
+                    # 5. Decode bytes to string
+                    decoded_string = decoded_bytes.decode('utf-8', errors='ignore')
+                    
+                    # 6. Check for our keywords and set data
+                    if extract_id_details(decoded_string, data):
+                        break # Found it, stop checking parts
+                
+                except Exception:
+                    # Not Base64, ignore and continue
+                    pass
+            
+            if data["Type"] != "-":
+                break # Found it, stop checking headers
+
     return data
+
 
 def fetch_emails(last_uid=None, mailbox="inbox"):
     """Fetch emails from a given mailbox (Inbox or Spam)."""
