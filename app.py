@@ -5,265 +5,290 @@ from email.header import decode_header
 import datetime
 import re
 import pandas as pd
-import pytz
+import base64  # Make sure this is imported
 
-# ---------- Page Setup ----------
-st.set_page_config(page_title="Multi-Account Inbox Comparator", layout="wide")
-st.title("📧 Multi-Account Inbox Comparator (5 accounts)")
+# --- Page Setup ---
+st.set_page_config(page_title="Email Auth Checker", layout="wide")
+st.title("📧 Email Authentication Report (SPF/DKIM/DMARC)")
 
-# ---------- Robust Session State Initialization ----------
-if "accounts" not in st.session_state:
-    st.session_state.accounts = {}
+# --- Session state setup ---
+if 'df' not in st.session_state:
+    st.session_state.df = pd.DataFrame()
+if 'last_uid' not in st.session_state:
+    st.session_state.last_uid = None
+if 'spam_df' not in st.session_state:
+    st.session_state.spam_df = pd.DataFrame()
+if 'email_input' not in st.session_state:
+    st.session_state.email_input = ""
+if 'password_input' not in st.session_state:
+    st.session_state.password_input = ""
 
-default_account_structure = {
-    "email": "", "pwd": "", "last_uid": None,
-    "df": pd.DataFrame(columns=["UID", "Domain", "Subject", "From", "SPF", "DKIM", "DMARC", "is_new"])
-}
+# --- Email + Password + Refresh Row ---
+with st.container():
+    col1, col2, col3 = st.columns([3, 3, 1.2])
 
-for i in range(1, 6):
-    acc_key = f"acc{i}"
-    if acc_key not in st.session_state.accounts or "last_uid" not in st.session_state.accounts[acc_key]:
-        st.session_state.accounts[acc_key] = default_account_structure.copy()
-        st.session_state.accounts[acc_key]["df"] = pd.DataFrame(
-            columns=["UID", "Domain", "Subject", "From", "SPF", "DKIM", "DMARC", "is_new"]
-        )
+    with col1:
+        email_input = st.text_input("📧 Gmail Address", key="email_box")
 
-# ---------- Utilities ----------
+    with col2:
+        password_input = st.text_input("🔐 App Password", type="password", key="pwd_box")
+
+    with col3:
+        st.markdown("####")  # spacing alignment
+        if st.button("🔁", help="Clear email and password"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+# --- Store credentials in session state for reruns ---
+st.session_state.email_input = email_input
+st.session_state.password_input = password_input
+
+# --- Validation ---
+if not st.session_state.email_input or not st.session_state.password_input:
+    st.warning("Please enter both your Gmail address and an App Password to continue.")
+    st.stop()
+
+# --- Utility Functions ---
 def decode_mime_words(s):
-    """Robust decoder for email headers, handles unknown-8bit safely."""
+    """Decode MIME encoded words safely."""
+    decoded_string = ""
     if not s:
-        return ""
-    decoded = ''
-    for word, enc in decode_header(s):
-        if isinstance(word, bytes):
-            try:
-                if enc and enc.lower() not in ["unknown-8bit", "x-unknown"]:
-                    decoded += word.decode(enc, errors="ignore")
-                else:
-                    decoded += word.decode("utf-8", errors="ignore")
-            except Exception:
-                decoded += word.decode("utf-8", errors="ignore")
-        else:
-            decoded += word
-    return decoded.strip()
+        return decoded_string
+    for part, encoding in decode_header(s):
+        try:
+            if isinstance(part, bytes):
+                decoded_string += part.decode(encoding or 'utf-8', errors='ignore')
+            else:
+                decoded_string += part
+        except (LookupError, TypeError):
+            if isinstance(part, bytes):
+                decoded_string += part.decode('utf-8', errors='ignore')
+            else:
+                decoded_string += str(part)
+    return decoded_string.strip()
 
-def extract_domain_from_address(address):
-    if not address:
-        return "-"
-    m = re.search(r'@([\w\.-]+)', address)
-    return m.group(1).lower() if m else "-"
+# --- *** NEW, CORRECTED HELPER FUNCTION *** ---
+def extract_id_details(search_string, data):
+    """
+    Finds the *first* matching Sub ID pattern in the search_string
+    and sets the Type *based on that specific match*.
+    """
+    # We only care about the first match we find
+    sub_id_match = re.search(
+        r'(GTC-[^@_]+|GMFP-[^@_]+|GRM-[^@_]+)', 
+        search_string, 
+        re.I
+    )
 
-def extract_auth_results_from_headers(msg):
-    auth_header = msg.get("Authentication-Results", "")
-    spf = dkim = dmarc = 'neutral'
-    m_spf = re.search(r'spf=(\w+)', auth_header, re.I)
-    m_dkim = re.search(r'dkim=(\w+)', auth_header, re.I)
-    m_dmarc = re.search(r'dmarc=(\w+)', auth_header, re.I)
-    if m_spf: spf = m_spf.group(1).lower()
-    if m_dkim: dkim = m_dkim.group(1).lower()
-    if m_dmarc: dmarc = m_dmarc.group(1).lower()
-    return spf, dkim, dmarc
+    if sub_id_match:
+        # Get the actual matched string (e.g., "GMFP-NL-FIAIUE...")
+        matched_id_string = sub_id_match.group(1)
+        
+        # Store it as the Sub ID
+        data["Sub ID"] = matched_id_string
+        
+        # Now, set the Type based *only on this matched string*
+        id_lower = matched_id_string.lower()
+        
+        if 'grm' in id_lower:
+            data["Type"] = 'FPR'
+        elif 'gmfp' in id_lower:
+            data["Type"] = 'FP'
+        elif 'gtc' in id_lower:
+            data["Type"] = 'FPTC'
+        
+        # Return True. We found one, we are done.
+        return True
+        
+    # No match was found in this string
+    return False
 
-def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None):
+# --- PARSE FUNCTION (Now uses the new helper) ---
+def parse_email_message(msg):
+    """Extracts all relevant details from an email message object."""
+    
+    data = {
+        "Subject": decode_mime_words(msg.get("Subject", "No Subject")),
+        "Date": msg.get("Date", "No Date"),
+        "SPF": "-", "DKIM": "-", "DMARC": "-", "Domain": "-",
+        "Type": "-", "Sub ID": "-", "Message-ID": decode_mime_words(msg.get("Message-ID", ""))
+    }
+
+    # --- Standard Header Parsing (SPF, DKIM, Domain, etc.) ---
+    headers_str = ''.join(f"{header}: {value}\n" for header, value in msg.items())
+    
+    match_auth = re.search(r'Authentication-Results:.*?smtp.mailfrom=([\w\.-]+)', headers_str, re.I)
+    if match_auth:
+        data["Domain"] = match_auth.group(1).lower()
+    else:
+        from_header = decode_mime_words(msg.get('From', ''))
+        match = re.search(r'@([\w\.-]+)', from_header)
+        if match:
+            data["Domain"] = match.group(1).lower()
+
+    spf_match = re.search(r'spf=(\w+)', headers_str, re.I)
+    dkim_match = re.search(r'dkim=(\w+)', headers_str, re.I)
+    dmarc_match = re.search(r'dmarc=(\w+)', headers_str, re.I)
+    if spf_match: data["SPF"] = spf_match.group(1).lower()
+    if dkim_match: data["DKIM"] = dkim_match.group(1).lower()
+    if dmarc_match: data["DMARC"] = dmarc_match.group(1).lower()
+
+    # --- TWO-STEP LOGIC ---
+
+    # --- Step 1: Check for plain text IDs first ---
+    # We pass the entire raw header block to the helper.
+    # The new helper will find the *first* pattern and set Type correctly.
+    found_plain_id = extract_id_details(headers_str, data)
+
+    # --- Step 2: If no plain text ID was found, *then* try decoding ---
+    if not found_plain_id:
+        # Iterate through *all* email headers to find the encoded string
+        for header_name, header_value in msg.items():
+            
+            if not header_value:
+                continue
+            
+            # 1. Split the header value by underscores
+            parts = str(header_value).split('_')
+            
+            # 2. Try to decode each part
+            for part in parts:
+                if len(part) < 20: # Skip short parts
+                    continue
+                
+                try:
+                    # 3. Add correct Base64 padding
+                    padded_part = part + '=' * (-len(part) % 4)
+                    
+                    # 4. Decode from Base64
+                    decoded_bytes = base64.b64decode(padded_part)
+                    
+                    # 5. Decode bytes to string
+                    decoded_string = decoded_bytes.decode('utf-8', errors='ignore')
+                    
+                    # 6. Check for our keywords and set data
+                    if extract_id_details(decoded_string, data):
+                        break # Found it, stop checking parts
+                
+                except Exception:
+                    # Not Base64, ignore and continue
+                    pass
+            
+            if data["Type"] != "-":
+                break # Found it, stop checking headers
+
+    return data
+
+
+def fetch_emails(last_uid=None, mailbox="inbox"):
+    """Fetch emails from a given mailbox (Inbox or Spam)."""
     results = []
     new_last_uid = last_uid
     try:
-        email_addr, password = email_addr.strip(), password.strip()
-        if any(c in email_addr or c in password for c in [' ', '\n']):
-            st.warning(f"⚠️ Credentials for {email_addr} may contain hidden spaces/newlines.")
-
         imap = imaplib.IMAP4_SSL("imap.gmail.com")
-        imap.login(email_addr, password)
-        imap.select("inbox")
+        imap.login(st.session_state.email_input, st.session_state.password_input)
+        imap.select(mailbox)
+
+        today = datetime.datetime.now().strftime("%d-%b-%Y")
+        criteria = f'(UID {int(last_uid)+1}:* SINCE {today})' if last_uid and mailbox=="inbox" else f'(SINCE {today})'
         
-        uids = []
-        if last_uid:
-            try:
-                criteria = f'(UID {int(last_uid)+1}:*)'
-                status, data = imap.uid('search', None, criteria)
-                if status == 'OK' and data and data[0]: 
-                    uids = data[0].split()
-            except Exception: 
-                pass
-        elif fetch_n:
-            status, data = imap.uid('search', None, 'ALL')
-            if status == 'OK' and data and data[0]: 
-                uids = data[0].split()[-int(fetch_n):]
-        else:
-            ist = pytz.timezone('Asia/Kolkata')
-            today_ist = datetime.datetime.now(ist).strftime("%d-%b-%Y")
-            status, data = imap.uid('search', None, f'(SINCE "{today_ist}")')
-            if status == 'OK' and data and data[0]: 
-                uids = data[0].split()
+        status, data = imap.uid('search', None, criteria)
+        uids = data[0].split()
 
         for uid in uids:
-            if not uid: 
-                continue
-            uid_dec = uid.decode()
-            res, msg_data = imap.uid('fetch', uid_dec, '(BODY.PEEK[HEADER])')
-            if res == 'OK' and isinstance(msg_data[0], tuple):
-                msg = email.message_from_bytes(msg_data[0][1])
-                subject = decode_mime_words(msg.get("Subject", "No Subject"))
-                from_header = decode_mime_words(msg.get("From", "-"))
-                domain = extract_domain_from_address(from_header)
-                spf, dkim, dmarc = extract_auth_results_from_headers(msg)
-                results.append({
-                    "UID": uid_dec, "Domain": domain, "Subject": subject,
-                    "From": from_header, "SPF": spf, "DKIM": dkim, "DMARC": dmarc
-                })
-                if new_last_uid is None or int(uid_dec) > int(new_last_uid):
-                    new_last_uid = uid_dec
+            uid_decoded = uid.decode()
+            _, msg_data = imap.uid('fetch', uid, '(BODY.PEEK[HEADER])')
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    msg = email.message_from_bytes(response_part[1])
+                    email_data = parse_email_message(msg)
+                    email_data["Mailbox"] = "Inbox" if mailbox == "inbox" else "Spam"
+                    results.append(email_data)
+            if mailbox == "inbox":
+                new_last_uid = uid_decoded
         imap.logout()
-    except imaplib.IMAP4.error as e: 
-        st.error(f"IMAP error for {email_addr}: {e}")
-    except Exception as e: 
-        st.error(f"Error fetching {email_addr}: {e}")
+    except Exception as e:
+        st.error(f"❌ Error fetching from {mailbox}: {str(e)}")
     return pd.DataFrame(results), new_last_uid
 
-def highlight_new_rows(row):
-    return ['background-color: #90EE90'] * len(row) if row.get("is_new", False) else [''] * len(row)
+def fetch_all_emails(last_uid=None):
+    """Fetch from Inbox and Spam together, avoiding duplicates."""
+    inbox_df, new_uid = fetch_emails(last_uid, "inbox")
+    spam_df, _ = fetch_emails(None, "[Gmail]/Spam")
 
-# ---------- Account Input UI ----------
-st.markdown("### Enter 5 Gmail accounts (email + app password)")
-cols = st.columns(5)
-for i, col in enumerate(cols, start=1):
-    with col:
-        acc_key = f"acc{i}"
-        st.session_state.accounts[acc_key]["email"] = st.text_input(
-            f"Account {i} Email", value=st.session_state.accounts[acc_key]["email"], key=f"email{i}"
-        )
-        st.session_state.accounts[acc_key]["pwd"] = st.text_input(
-            f"Password {i}", value=st.session_state.accounts[acc_key]["pwd"], type="password", key=f"pwd{i}"
-        )
+    combined_df = pd.concat([inbox_df, spam_df], ignore_index=True)
 
-# ---------- Fetch Controls ----------
-st.markdown("---")
-colA, colB, colC = st.columns([1, 1, 1])
+    # Drop duplicates using Message-ID
+    if not st.session_state.df.empty:
+        seen_ids = set(st.session_state.df["Message-ID"].dropna())
+        combined_df = combined_df[~combined_df["Message-ID"].isin(seen_ids)]
 
-def process_fetch(fetch_type, fetch_n=None):
-    for i in range(1, 6):
-        if "is_new" in st.session_state.accounts[f"acc{i}"]["df"].columns:
-            st.session_state.accounts[f"acc{i}"]["df"]["is_new"] = False
-    any_run = False
-    for i in range(1, 6):
-        acct = st.session_state.accounts[f"acc{i}"]
-        if not acct.get("email") or not acct.get("pwd"):
-            if fetch_type != 'clear': 
-                st.warning(f"Account {i} missing credentials — skipping.")
-            continue
-        any_run = True
-        df_new, new_uid = (
-            fetch_inbox_emails_single(acct["email"], acct["pwd"], last_uid=acct.get("last_uid"))
-            if fetch_type == 'incremental'
-            else fetch_inbox_emails_single(acct["email"], acct["pwd"], fetch_n=int(fetch_n))
-        )
-        if not df_new.empty:
-            df_new["is_new"] = True
-            acct["df"] = pd.concat([acct["df"], df_new], ignore_index=True).drop_duplicates(subset=["UID"], keep='last')
-            try: 
-                acct["last_uid"] = str(acct["df"]["UID"].astype(int).max())
-            except (ValueError, IndexError): 
-                acct["last_uid"] = acct.get("last_uid")
-    return any_run
+    return combined_df, new_uid
+
+def fetch_spam_emails():
+    """Fetch today's spam emails (standalone button, avoid duplicates)."""
+    spam_df, _ = fetch_emails(None, "[Gmail]/Spam")
+
+    if not st.session_state.spam_df.empty:
+        seen_ids = set(st.session_state.spam_df["Message-ID"].dropna())
+        spam_df = spam_df[~spam_df["Message-ID"].isin(seen_ids)]
+
+    return spam_df
+
+# --- Action Buttons ---
+colA, colB = st.columns(2)
 
 with colA:
-    if st.button("🔄 Fetch New Emails (incremental)"):
-        if process_fetch('incremental'): 
-            st.success("Fetched incremental emails.")
+    button_label = "🔄 Fetch New Emails" if not st.session_state.df.empty else "📥 Fetch Today's Emails"
+    if st.button(button_label):
+        with st.spinner("Fetching emails (Inbox + Spam)..."):
+            df, new_uid = fetch_all_emails(st.session_state.last_uid)
+            if not df.empty:
+                st.session_state.df = pd.concat([df, st.session_state.df], ignore_index=True)
+                st.session_state.last_uid = new_uid
+                st.success(f"✅ Fetched {len(df)} new unique emails (Inbox + Spam).")
+            else:
+                st.info("No new emails found.")
+
 with colB:
-    fetch_n = st.number_input("Fetch last N emails", min_value=1, value=10, step=1)
-    if st.button("📥 Fetch Last N Emails"):
-        if process_fetch('last_n', fetch_n): 
-            st.success(f"Fetched last {fetch_n} emails.")
-with colC:
-    if st.button("🗑️ Clear All Stored Data"):
-        for i in range(1, 6):
-            st.session_state.accounts[f"acc{i}"] = default_account_structure.copy()
-            st.session_state.accounts[f"acc{i}"]["df"] = pd.DataFrame(
-                columns=["UID", "Domain", "Subject", "From", "SPF", "DKIM", "DMARC", "is_new"]
-            )
-        st.success("Cleared all stored data."); st.rerun()
+    if st.button("🗑️ List Today's Spam"):
+         with st.spinner("Fetching today's spam..."):
+            spam_df = fetch_spam_emails()
+            if not spam_df.empty:
+                st.session_state.spam_df = pd.concat([spam_df, st.session_state.spam_df], ignore_index=True)
+                st.success(f"✅ Added {len(spam_df)} unique spam emails for today.")
+            else:
+                st.info("No new spam emails found for today.")
 
-# ---------- Email Counts ----------
-st.markdown("### 📊 Email Counts per Account (Total Fetched)")
-count_cols = st.columns(5)
-for i, col in enumerate(count_cols, start=1):
-    acct = st.session_state.accounts[f"acc{i}"]
-    acct_df, total_count = acct["df"], len(acct["df"])
-    new_count = acct_df["is_new"].sum() if "is_new" in acct_df.columns else 0
-    email_label = acct.get("email", f"Account {i}")
-    email_label = email_label.split('@')[0] if '@' in email_label else email_label
-    col.metric(label=email_label, value=total_count, delta=f"{new_count} New" if new_count > 0 else None)
+# --- Inbox + Spam Display ---
+st.subheader("📬 Today's Processed Emails (Inbox + Spam)")
+inbox_cols = ["Subject", "Date", "Domain", "SPF", "DKIM", "DMARC", "Type", "Mailbox"]
 
-st.markdown("---")
-
-# ---------- Email Presence Table ----------
-all_keys, account_keys, new_email_keys = set(), {}, set()
-for i in range(1, 6):
-    df_acc = st.session_state.accounts[f"acc{i}"]["df"]
-    keys = set()
-    for _, row in df_acc.iterrows():
-        email_key = (row["Domain"], row["Subject"], row["From"], row["SPF"], row["DKIM"], row["DMARC"])
-        keys.add(email_key)
-        if row.get("is_new", False): 
-            new_email_keys.add(email_key)
-    account_keys[f"acc{i}"] = keys
-    all_keys.update(keys)
-
-rows = []
-sorted_keys = sorted(list(all_keys), key=lambda k: (k not in new_email_keys, k[0], k[1]))
-
-for (domain, subject, from_val, spf, dkim, dmarc) in sorted_keys:
-    flags = ["✅" if (domain, subject, from_val, spf, dkim, dmarc) in account_keys[f"acc{i}"] else "❌" for i in range(1, 6)]
-    auth_status = "Pass" if all(res == 'pass' for res in [spf, dkim, dmarc]) else "Fail"
-    rows.append({
-        "Domain": domain, "From": from_val, "Subject": subject,
-        "Mail1": flags[0], "Mail2": flags[1], "Mail3": flags[2],
-        "Mail4": flags[3], "Mail5": flags[4], "Auth": auth_status,
-        "is_new": (domain, subject, from_val, spf, dkim, dmarc) in new_email_keys
-    })
-
-if rows:
-    st.subheader("📋 Email Presence Table (Newest on Top)")
-    st.dataframe(pd.DataFrame(rows).style.apply(highlight_new_rows, axis=1), hide_index=True, column_config={"is_new": None})
+if not st.session_state.df.empty:
+    display_df = st.session_state.df.reindex(columns=inbox_cols, fill_value="-")
+    st.dataframe(display_df)
 else:
-    st.info("No emails fetched for the Presence Table yet.")
+    st.info("No email data yet. Click 'Fetch Today's Emails' to begin.")
 
-# ---------- Combined Master Inbox ----------
-st.markdown("---")
-st.subheader("📬 Combined Master Inbox (All Accounts)")
-all_dfs = []
-for i in range(1, 6):
-    acct = st.session_state.accounts[f"acc{i}"]
-    if not acct['df'].empty and acct.get('email'):
-        df_copy = acct['df'].copy()
-        df_copy['Source Account'] = acct['email']
-        all_dfs.append(df_copy)
+# --- Failed Auth Display ---
+if not st.session_state.df.empty:
+    failed_df = st.session_state.df[
+        (st.session_state.df["SPF"] != "pass") |
+        (st.session_state.df["DKIM"] != "pass") |
+        (st.session_state.df["DMARC"] != "pass")
+    ]
 
-if all_dfs:
-    combined_df = pd.concat(all_dfs, ignore_index=True)
-    combined_df['UID_int'] = pd.to_numeric(combined_df['UID'], errors='coerce')
-    sorted_combined_df = combined_df.sort_values(by=["is_new", "UID_int"], ascending=[False, False])
-    display_cols = ["Source Account", "Domain", "From", "Subject", "SPF", "DKIM", "DMARC", "is_new"]
-    st.dataframe(
-        sorted_combined_df[display_cols].style.apply(highlight_new_rows, axis=1),
-        hide_index=True,
-        column_config={"is_new": None}
-    )
-else:
-    st.info("No emails fetched to display in the master inbox. Enter credentials and fetch emails above.")
+    if not failed_df.empty:
+        st.subheader("❌ Failed Auth Emails")
+        failed_cols = ["Subject", "Domain", "SPF", "DKIM", "DMARC", "Type", "Sub ID", "Mailbox"]
+        st.dataframe(failed_df[failed_cols])
+    else:
+        st.success("✅ All fetched emails passed SPF, DKIM, and DMARC.")
 
-# ---------- Individual Raw Data ----------
-with st.expander("Show Individual Raw Messages (Newest on Top)"):
-    for i in range(1, 6):
-        acct = st.session_state.accounts[f'acc{i}']
-        st.markdown(f"**Account {i}: {acct.get('email', 'N/A')}** — Stored: {len(acct['df'])}")
-        if not acct["df"].empty:
-            df_to_show = acct["df"].copy()
-            df_to_show['UID_int'] = pd.to_numeric(df_to_show['UID'], errors='coerce')
-            sorted_df_to_show = df_to_show.sort_values(by=["is_new", "UID_int"], ascending=[False, False])
-            st.dataframe(
-                sorted_df_to_show.drop(columns=['UID_int']).style.apply(highlight_new_rows, axis=1),
-                hide_index=True,
-                column_config={"is_new": None}
-            )
+# --- Spam Folder Display ---
+if not st.session_state.spam_df.empty:
+    st.subheader("🚫 Today's Spam Folder Emails")
+    spam_cols = ["Subject", "Date", "Domain", "Type", "Mailbox"]
+    display_spam_df = st.session_state.spam_df.reindex(columns=spam_cols, fill_value="-")
+    st.dataframe(display_spam_df)
