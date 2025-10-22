@@ -68,13 +68,15 @@ def decode_mime_words(s):
                 decoded_string += str(part)
     return decoded_string.strip()
 
+# --- UPDATED HELPER FUNCTION (REMOVED AJ/AGM) ---
 def extract_id_details(decoded_string, data):
     """Helper function to populate Type and Sub ID from a string."""
     
     # Check if Sub ID is already found; if so, don't overwrite it
     if not data.get("Sub ID") or data.get("Sub ID") == "-":
+        # UPDATED Regex: Removed AGM- and AJTC-
         sub_id_match = re.search(
-            r'(GTC-[^@_]+|GMFP-[^@_]+|GRM-[^@_]+|AGM-[^@_]+|AJTC-[^@_]+)', 
+            r'(GTC-[^@_]+|GMFP-[^@_]+|GRM-[^@_]+)', 
             decoded_string, 
             re.I
         )
@@ -84,12 +86,9 @@ def extract_id_details(decoded_string, data):
     str_lower = decoded_string.lower()
     
     # Set Type based on keywords
+    # UPDATED logic: Removed agm and ajtc
     if 'grm' in str_lower:
         data["Type"] = 'FPR'
-    elif 'agm' in str_lower:
-        data["Type"] = 'AJ '
-    elif 'ajtc' in str_lower:
-        data["Type"] = 'AJTC'
     elif 'gtc' in str_lower:
         data["Type"] = 'FPTC'
     elif 'gmfp' in str_lower:
@@ -98,7 +97,7 @@ def extract_id_details(decoded_string, data):
     # Return True if we found a type, so we can stop searching
     return data["Type"] != "-"
 
-# --- UPDATED PARSE FUNCTION ---
+# --- PARSE FUNCTION (No changes needed here) ---
 def parse_email_message(msg):
     """Extracts all relevant details from an email message object."""
     
@@ -131,8 +130,6 @@ def parse_email_message(msg):
     # --- NEW TWO-STEP LOGIC ---
 
     # --- Step 1: Check for plain text IDs first ---
-    # We pass the entire raw header block to the helper.
-    # This will find any *undecoded* IDs (like GTC-, GMFP-)
     extract_id_details(headers_str, data)
 
     # --- Step 2: If no plain text ID was found, *then* try decoding ---
@@ -250,7 +247,7 @@ with colB:
          with st.spinner("Fetching today's spam..."):
             spam_df = fetch_spam_emails()
             if not spam_df.empty:
-                st.session_state.spam_df = pd.concat([spam_df, st.session_state.spam_df], ignore_index=True)
+                st.session_state.spam_df = pd.concat([spam_fs, st.session_state.spam_df], ignore_index=True)
                 st.success(f"✅ Added {len(spam_df)} unique spam emails for today.")
             else:
                 st.info("No new spam emails found for today.")
