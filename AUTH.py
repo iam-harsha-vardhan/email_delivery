@@ -46,14 +46,12 @@ with st.container():
         # st.date_input for date range selection
         date_range = st.date_input(
             "Select Date Range", 
-            # Use the stored range, defaulting to today if stored is empty or invalid
             value=st.session_state.fetch_dates, 
             max_value=today,
             key="date_box",
             help="Select the start and end dates for fetching emails (up to 2 dates)."
         )
         
-        # --- UI LOGIC MODIFICATION START ---
         # Handle date_input output: ensure it's always a tuple of (start, end)
         if isinstance(date_range, tuple) and len(date_range) == 2:
             start_date, end_date = date_range
@@ -68,8 +66,6 @@ with st.container():
         elif date_range is None or len(date_range) == 0:
             # If nothing is selected or cleared, default to Today only
             st.session_state.fetch_dates = (today, today)
-
-        # --- UI LOGIC MODIFICATION END ---
 
 
     with col4:
@@ -89,12 +85,12 @@ if not st.session_state.email_input or not st.session_state.password_input:
     st.warning("Please enter both your Gmail address and an App Password to continue.")
     st.stop()
 
-# --- Get dates (Now guaranteed to be a valid tuple of two dates) ---
+# --- Get dates ---
 START_DATE = st.session_state.fetch_dates[0]
 END_DATE = st.session_state.fetch_dates[1]
 
 
-# --- Utility Functions (All logic remains the same) ---
+# --- Utility Functions ---
 
 def decode_mime_words(s):
     """Decode MIME encoded words safely."""
@@ -192,23 +188,30 @@ def parse_email_message(msg):
     return data
 
 
-def fetch_emails(start_date, end_date, mailbox="inbox"):
-    """Fetch emails from a given mailbox based on date range (inclusive of start/end dates)."""
+def fetch_emails(start_date, end_date, mailbox="inbox", use_uid_since=False, last_uid=None):
+    """
+    Fetch emails. Uses SINCE/BEFORE for full range, or UID+SINCE for incremental (Inbox only).
+    """
     results = []
     
     start_date_str = start_date.strftime("%d-%b-%Y")
     day_after_end = end_date + datetime.timedelta(days=1)
     day_after_end_str = day_after_end.strftime("%d-%b-%Y")
     
-    new_last_uid = None 
+    new_last_uid = last_uid
     
     try:
         imap = imaplib.IMAP4_SSL("imap.gmail.com")
         imap.login(st.session_state.email_input, st.session_state.password_input)
         imap.select(mailbox)
 
-        criteria = f'(SINCE {start_date_str} BEFORE {day_after_end_str})'
-        
+        if mailbox == "inbox" and use_uid_since and last_uid:
+             # Incremental fetch: new UIDs since the last one, constrained by the start date
+             criteria = f'(UID {int(last_uid)+1}:* SINCE {start_date_str} BEFORE {day_after_end_str})'
+        else:
+             # Full date range fetch (used for initial fetch, full spam, or explicit request)
+             criteria = f'(SINCE {start_date_str} BEFORE {day_after_end_str})'
+
         status, data = imap.uid('search', None, criteria)
         uids = data[0].split()
 
@@ -238,22 +241,31 @@ def fetch_emails(start_date, end_date, mailbox="inbox"):
     return pd.DataFrame(results, columns=DF_COLS), new_last_uid
 
 
-def fetch_all_emails(start_date, end_date):
-    """Fetch from Inbox and Spam together, avoiding duplicates."""
+def process_fetch_results(new_df, new_uid, target_df):
+    """Handles concatenation, deduplication, and sorting for main DF."""
     
-    inbox_df, new_uid = fetch_emails(start_date, end_date, "inbox")
-    spam_df, _ = fetch_emails(start_date, end_date, "[Gmail]/Spam") 
+    # Mark existing data as old
+    if not target_df.empty:
+        target_df.loc[:, "New_Fetch"] = False 
+        
+        # Drop duplicates from the new fetch based on Message-ID
+        seen_ids = set(target_df["Message-ID"].dropna())
+        new_df = new_df[~new_df["Message-ID"].isin(seen_ids)].copy()
 
-    combined_df = pd.concat([inbox_df, spam_df], ignore_index=True)
+    if not new_df.empty:
+        # Concatenate and sort
+        combined_df = pd.concat([new_df, target_df], ignore_index=True)
+        combined_df = combined_df.sort_values(
+            by='New_Fetch', 
+            ascending=False, 
+            ignore_index=True
+        )
+        return combined_df, len(new_df), new_uid
+    
+    return target_df, 0, new_uid
 
-    if not st.session_state.df.empty:
-        st.session_state.df.loc[:, "New_Fetch"] = False 
-        seen_ids = set(st.session_state.df["Message-ID"].dropna())
-        combined_df = combined_df[~combined_df["Message-ID"].isin(seen_ids)].copy()
 
-    return combined_df, new_uid
-
-# --- Styling Functions ---
+# --- Styling Functions (Unchanged) ---
 
 def highlight_failed_auth(row):
     """Applies a light red background to rows where SPF, DKIM, or DMARC is not 'pass'."""
@@ -297,63 +309,94 @@ def highlight_main_table(row):
 
 
 # --- Action Buttons ---
-colA, colB = st.columns([1.5, 2])
+colA, colB, colC = st.columns([1.5, 1.5, 1])
+
+# --- Generate dynamic labels ---
+if START_DATE == END_DATE:
+    range_label = f" ({START_DATE})"
+    fetch_description = "all emails for this specific day."
+else:
+    range_label = f" ({START_DATE} to {END_DATE})"
+    fetch_description = "all emails within this date range."
+
 
 with colA:
-    # Update button label to dynamically reflect the selected range
-    if START_DATE == END_DATE:
-        date_range_label = f" (Today, {START_DATE})"
-    else:
-        date_range_label = f" ({START_DATE} to {END_DATE})"
+    # 1. INITIAL/FULL FETCH: Fetches the entire selected date range and overwrites/resets data.
+    button_label = f"📥 Fetch {range_label}"
+    if st.button(button_label, help=f"Fetches {fetch_description} (Inbox + Spam) and **replaces** the current data."):
         
-    if st.button(f"📥 Fetch Date Range {date_range_label}", help="Fetches ALL emails from Inbox and Spam within the selected date range and adds new unique emails to the table."):
-        
-        if not st.session_state.df.empty:
-             st.session_state.df.loc[:, "New_Fetch"] = False
+        # Reset data for a full fetch
+        st.session_state.df = pd.DataFrame(columns=DF_COLS)
+        st.session_state.last_uid = None
 
-        with st.spinner(f"Fetching emails for date range {date_range_label} (Inbox + Spam)..."):
+        with st.spinner(f"Fetching {fetch_description} (Inbox + Spam)..."):
             
-            df_new, new_uid = fetch_all_emails(START_DATE, END_DATE)
-            
-            if not df_new.empty:
-                st.session_state.df = pd.concat([df_new, st.session_state.df], ignore_index=True)
-                st.session_state.df = st.session_state.df.sort_values(
-                    by='New_Fetch', 
-                    ascending=False, 
-                    ignore_index=True
-                )
+            inbox_df, new_uid = fetch_emails(START_DATE, END_DATE, "inbox", use_uid_since=False)
+            spam_df, _ = fetch_emails(START_DATE, END_DATE, "[Gmail]/Spam", use_uid_since=False)
+            df_new = pd.concat([inbox_df, spam_df], ignore_index=True)
+
+            st.session_state.df, fetched_count, st.session_state.last_uid = process_fetch_results(
+                df_new, new_uid, st.session_state.df
+            )
                 
-                if new_uid:
-                    st.session_state.last_uid = new_uid
-
-                st.success(f"✅ Fetched and added {len(df_new)} new unique emails for {date_range_label}.")
+            if fetched_count > 0:
+                st.success(f"✅ Fetched and added {fetched_count} unique emails for {range_label}.")
             else:
-                st.info(f"No new unique emails found for the date range {date_range_label}.")
+                st.info(f"No emails found for the date range {range_label}.")
+
 
 with colB:
-    spam_label = f" ({START_DATE} to {END_DATE})"
-    if st.button(f"🗑️ Fetch Spam Folder {spam_label}", help="Fetches all unique spam emails within the selected date range."):
+    # 2. INCREMENTAL FETCH: Fetches only new UIDs since the last run, constrained by the date range.
+    button_label = f"🔄 Fetch New Mails {range_label}"
+    if st.button(button_label, help=f"Fetches new emails since the last run (incremental) within {range_label}."):
+        
+        # Determine if we should use UID (only if we have existing data)
+        use_uid = not st.session_state.df.empty and st.session_state.last_uid is not None
+
+        with st.spinner(f"Fetching new emails incrementally for {range_label}..."):
+            
+            # Fetch new inbox data using UID+SINCE (if applicable)
+            inbox_df, new_uid = fetch_emails(
+                START_DATE, 
+                END_DATE, 
+                "inbox", 
+                use_uid_since=use_uid, 
+                last_uid=st.session_state.last_uid
+            )
+            
+            # Spam is always a full date range check for deduplication
+            spam_df, _ = fetch_emails(START_DATE, END_DATE, "[Gmail]/Spam", use_uid_since=False)
+            df_new = pd.concat([inbox_df, spam_df], ignore_index=True)
+            
+            # Process and merge results
+            st.session_state.df, fetched_count, st.session_state.last_uid = process_fetch_results(
+                df_new, new_uid, st.session_state.df
+            )
+                
+            if fetched_count > 0:
+                st.success(f"✅ Fetched and added {fetched_count} new unique emails for {range_label}.")
+            else:
+                st.info(f"No new unique emails found for {range_label}.")
+
+
+with colC:
+    # 3. SPAM FETCH
+    if st.button(f"🗑️ Fetch Spam Only", help=f"Fetches all unique spam emails within {range_label}."):
          
          if not st.session_state.spam_df.empty:
              st.session_state.spam_df.loc[:, "New_Fetch"] = False
 
-         with st.spinner(f"Fetching spam folder for {spam_label}..."):
-            spam_df_new, _ = fetch_emails(START_DATE, END_DATE, "[Gmail]/Spam")
+         with st.spinner(f"Fetching spam folder for {range_label}..."):
+            spam_df_new, _ = fetch_emails(START_DATE, END_DATE, "[Gmail]/Spam", use_uid_since=False)
             
-            if not st.session_state.spam_df.empty:
-                seen_ids = set(st.session_state.spam_df["Message-ID"].dropna())
-                spam_df_new = spam_df_new[~spam_df_new["Message-ID"].isin(seen_ids)].copy()
+            st.session_state.spam_df, fetched_count, _ = process_fetch_results(
+                spam_df_new, None, st.session_state.spam_df
+            )
             
-            if not spam_df_new.empty:
-                st.session_state.spam_df = pd.concat([spam_df_new, st.session_state.spam_df], ignore_index=True)
-                st.session_state.spam_df = st.session_state.spam_df.sort_values(
-                    by='New_Fetch', 
-                    ascending=False, 
-                    ignore_index=True
-                )
-                st.success(f"✅ Added {len(spam_df_new)} unique spam emails for {spam_label}.")
+            if fetched_count > 0:
+                st.success(f"✅ Added {fetched_count} unique spam emails for {range_label}.")
             else:
-                st.info(f"No new unique spam emails found for {spam_label}.")
+                st.info(f"No new unique spam emails found for {range_label}.")
 
 # --- Inbox + Spam Display ---
 st.subheader("📬 Processed Emails")
@@ -366,9 +409,9 @@ if not st.session_state.df.empty:
     
     st.dataframe(styled_display_df, use_container_width=True)
 else:
-    st.info(f"No email data yet. Select a date range and click 'Fetch Date Range'.")
+    st.info(f"No email data yet. Select a date range and click 'Fetch {range_label}'.")
 
-# --- Failed Auth Display (Styled with Red Background) ---
+# --- Failed Auth Display (Unchanged) ---
 if not st.session_state.df.empty:
     failed_df = st.session_state.df[
         (st.session_state.df["SPF"] != "pass") |
@@ -389,7 +432,7 @@ if not st.session_state.df.empty:
     else:
         st.success("✅ All fetched emails passed SPF, DKIM, and DMARC.")
 
-# --- Spam Folder Display (Styled with New Fetch Background) ---
+# --- Spam Folder Display (Unchanged) ---
 if not st.session_state.spam_df.empty:
     st.subheader("🚫 Spam Folder Emails")
     spam_cols = ["Subject", "Date", "Domain", "Type", "Mailbox"]
