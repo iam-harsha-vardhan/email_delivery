@@ -87,6 +87,7 @@ if not st.session_state.email_input or not st.session_state.password_input:
 START_DATE = st.session_state.fetch_dates[0]
 END_DATE = st.session_state.fetch_dates[1]
 IS_DEFAULT_TODAY = (START_DATE == today and END_DATE == today)
+IS_SINGLE_DAY = (START_DATE == END_DATE)
 
 
 # --- Utility Functions (Omitted for brevity, logic is unchanged from previous response) ---
@@ -303,68 +304,49 @@ def highlight_main_table(row):
 
 
 # --- Action Buttons ---
-colA, colB, colC = st.columns([1.5, 1.5, 1])
+colA, colB = st.columns([1.5, 2]) # Reduced columns back to two for the main fetch and spam fetch
 
-# --- Generate dynamic labels ---
+# --- Generate dynamic labels based on fetch state and date selection ---
 
-# Conditional labels for the buttons based on selected date range
 if IS_DEFAULT_TODAY:
-    # Original behavior: buttons refer to TODAY's mails
-    range_label = f" (Today, {today})"
-    fetch_description = "today's emails."
-    initial_button_text = "📥 Fetch Today's Mails"
-    incremental_button_text = "🔄 Fetch New Mails"
+    # If using default date (Today), use generic labels
+    initial_text = "📥 Fetch Today's Mails"
+    incremental_text = "🔄 Fetch New Mails"
+    range_text = "today's emails."
 else:
-    # Additional feature behavior: buttons refer to the selected date range
-    if START_DATE == END_DATE:
+    # If using custom date/range, use dynamic labels
+    if IS_SINGLE_DAY:
         range_label = f" ({START_DATE})"
     else:
         range_label = f" ({START_DATE} to {END_DATE})"
+        
+    initial_text = f"🗓️ Fetch Range {range_label}"
+    incremental_text = f"🔄 Fetch New {range_label}"
+    range_text = f"emails in the range {range_label}."
     
-    fetch_description = f"emails in the range {range_label}."
-    initial_button_text = f"🗓️ Fetch Range {range_label}"
-    incremental_button_text = f"🔄 Fetch New {range_label}"
+# Determine the single conditional button label
+button_label = incremental_text if not st.session_state.df.empty else initial_text
+button_help = f"Fetches {'new emails incrementally' if not st.session_state.df.empty else 'all emails'} for {range_text}."
 
 
 with colA:
-    # 1. INITIAL/FULL FETCH: Fetches the entire selected date range and overwrites/resets data.
-    if st.button(initial_button_text, help=f"Fetches {fetch_description} (Inbox + Spam) and **replaces** the current data."):
+    # --- 1 & 2. COMBINED CONDITIONAL FETCH BUTTON ---
+    if st.button(button_label, help=button_help):
         
-        # Reset data for a full fetch
-        st.session_state.df = pd.DataFrame(columns=DF_COLS)
-        st.session_state.last_uid = None
+        # Determine if this is an incremental fetch
+        use_uid_fetch = not st.session_state.df.empty and st.session_state.last_uid is not None
 
-        with st.spinner(f"Fetching {fetch_description} (Inbox + Spam)..."):
+        if not st.session_state.df.empty:
+             st.session_state.df.loc[:, "New_Fetch"] = False # Mark old data
+
+        with st.spinner(f"Fetching {range_text} (Inbox + Spam)..."):
             
-            inbox_df, new_uid = fetch_emails(START_DATE, END_DATE, "inbox", use_uid_since=False)
-            spam_df, _ = fetch_emails(START_DATE, END_DATE, "[Gmail]/Spam", use_uid_since=False)
-            df_new = pd.concat([inbox_df, spam_df], ignore_index=True)
-
-            st.session_state.df, fetched_count, st.session_state.last_uid = process_fetch_results(
-                df_new, new_uid, st.session_state.df
-            )
-                
-            if fetched_count > 0:
-                st.success(f"✅ Fetched and added {fetched_count} unique {fetch_description}.")
-            else:
-                st.info(f"No emails found for {fetch_description}.")
-
-
-with colB:
-    # 2. INCREMENTAL FETCH: Fetches only new UIDs since the last run, constrained by the date range.
-    if st.button(incremental_button_text, help=f"Fetches new emails since the last run (incremental) within {range_label}."):
-        
-        # Determine if we should use UID (only if we have existing data)
-        use_uid = not st.session_state.df.empty and st.session_state.last_uid is not None
-
-        with st.spinner(f"Fetching new emails incrementally for {range_label}..."):
-            
-            # Fetch new inbox data using UID+SINCE (if applicable)
+            # Fetch new inbox data using UID+SINCE (if applicable, or full range otherwise)
             inbox_df, new_uid = fetch_emails(
                 START_DATE, 
                 END_DATE, 
                 "inbox", 
-                use_uid_since=use_uid, 
+                use_uid_since=use_uid_fetch, 
                 last_uid=st.session_state.last_uid
             )
             
@@ -378,20 +360,22 @@ with colB:
             )
                 
             if fetched_count > 0:
-                st.success(f"✅ Fetched and added {fetched_count} new unique emails for {range_label}.")
+                st.success(f"✅ Fetched and added {fetched_count} unique emails for {range_text}.")
             else:
-                st.info(f"No new unique emails found for {range_label}.")
+                st.info(f"No new unique emails found for {range_text}.")
 
 
-with colC:
+with colB:
     # 3. SPAM FETCH
-    spam_button_label = f"🗑️ Fetch Spam {range_label}" if not IS_DEFAULT_TODAY else "🗑️ Fetch Spam Only"
-    if st.button(spam_button_label, help=f"Fetches all unique spam emails within {range_label}."):
+    spam_range_label = f" ({START_DATE} to {END_DATE})" if not IS_SINGLE_DAY else f" ({START_DATE})"
+    spam_button_label = f"🗑️ Fetch Spam {spam_range_label}"
+
+    if st.button(spam_button_label, help=f"Fetches all unique spam emails within {range_text}."):
          
          if not st.session_state.spam_df.empty:
              st.session_state.spam_df.loc[:, "New_Fetch"] = False
 
-         with st.spinner(f"Fetching spam folder for {range_label}..."):
+         with st.spinner(f"Fetching spam folder for {range_text}..."):
             spam_df_new, _ = fetch_emails(START_DATE, END_DATE, "[Gmail]/Spam", use_uid_since=False)
             
             st.session_state.spam_df, fetched_count, _ = process_fetch_results(
@@ -399,9 +383,9 @@ with colC:
             )
             
             if fetched_count > 0:
-                st.success(f"✅ Added {fetched_count} unique spam emails for {range_label}.")
+                st.success(f"✅ Added {fetched_count} unique spam emails for {range_text}.")
             else:
-                st.info(f"No new unique spam emails found for {range_label}.")
+                st.info(f"No new unique spam emails found for {range_text}.")
 
 # --- Inbox + Spam Display ---
 st.subheader("📬 Processed Emails")
@@ -414,7 +398,7 @@ if not st.session_state.df.empty:
     
     st.dataframe(styled_display_df, use_container_width=True)
 else:
-    st.info(f"No email data yet. Click '{initial_button_text}' to begin.")
+    st.info(f"No email data yet. Click '{initial_text}' to begin.")
 
 # --- Failed Auth Display ---
 if not st.session_state.df.empty:
