@@ -16,22 +16,20 @@ DF_COLS = ["Subject", "Date", "SPF", "DKIM", "DMARC", "Domain", "Type", "Sub ID"
 
 # --- Session state setup ---
 if 'df' not in st.session_state:
-    # Initialize df with all required columns, including New_Fetch, to prevent KeyError
     st.session_state.df = pd.DataFrame(columns=DF_COLS)
 if 'last_uid' not in st.session_state:
     st.session_state.last_uid = None
 if 'spam_df' not in st.session_state:
-    # Initialize spam_df with all required columns
     st.session_state.spam_df = pd.DataFrame(columns=DF_COLS)
 if 'email_input' not in st.session_state:
     st.session_state.email_input = ""
 if 'password_input' not in st.session_state:
     st.session_state.password_input = ""
-if 'fetch_dates' not in st.session_state:
-    today = datetime.date.today()
-    yesterday = today - datetime.timedelta(days=1)
-    # Initialize with a date range (yesterday to today)
-    st.session_state.fetch_dates = (yesterday, today)
+
+# --- Initialize or update dates to (Today, Today) if not set ---
+today = datetime.date.today()
+if 'fetch_dates' not in st.session_state or st.session_state.fetch_dates is None:
+    st.session_state.fetch_dates = (today, today)
 
 
 # --- Email + Password + Date Selection Row ---
@@ -48,19 +46,30 @@ with st.container():
         # st.date_input for date range selection
         date_range = st.date_input(
             "Select Date Range", 
+            # Use the stored range, defaulting to today if stored is empty or invalid
             value=st.session_state.fetch_dates, 
-            max_value=datetime.date.today(),
+            max_value=today,
             key="date_box",
             help="Select the start and end dates for fetching emails (up to 2 dates)."
         )
-        # Handle single date vs date range output from widget
+        
+        # --- UI LOGIC MODIFICATION START ---
+        # Handle date_input output: ensure it's always a tuple of (start, end)
         if isinstance(date_range, tuple) and len(date_range) == 2:
-            st.session_state.fetch_dates = date_range
+            start_date, end_date = date_range
+            if start_date > end_date: # Swap if inverted
+                start_date, end_date = end_date, start_date
+            st.session_state.fetch_dates = (start_date, end_date)
+            
         elif isinstance(date_range, datetime.date):
+            # If only one date is selected, treat it as (date, date)
             st.session_state.fetch_dates = (date_range, date_range)
-        # Ensure start is before or equal to end
-        if len(st.session_state.fetch_dates) == 2 and st.session_state.fetch_dates[0] > st.session_state.fetch_dates[1]:
-             st.session_state.fetch_dates = (st.session_state.fetch_dates[1], st.session_state.fetch_dates[0])
+            
+        elif date_range is None or len(date_range) == 0:
+            # If nothing is selected or cleared, default to Today only
+            st.session_state.fetch_dates = (today, today)
+
+        # --- UI LOGIC MODIFICATION END ---
 
 
     with col4:
@@ -79,16 +88,13 @@ st.session_state.password_input = password_input
 if not st.session_state.email_input or not st.session_state.password_input:
     st.warning("Please enter both your Gmail address and an App Password to continue.")
     st.stop()
-if len(st.session_state.fetch_dates) != 2:
-    st.warning("Please select a valid date range (or a single date).")
-    st.stop()
-    
-# Get dates
+
+# --- Get dates (Now guaranteed to be a valid tuple of two dates) ---
 START_DATE = st.session_state.fetch_dates[0]
 END_DATE = st.session_state.fetch_dates[1]
 
 
-# --- Utility Functions ---
+# --- Utility Functions (All logic remains the same) ---
 
 def decode_mime_words(s):
     """Decode MIME encoded words safely."""
@@ -139,7 +145,7 @@ def parse_email_message(msg):
         "Date": msg.get("Date", "No Date"),
         "SPF": "-", "DKIM": "-", "DMARC": "-", "Domain": "-", 
         "Type": "-", "Sub ID": "-", "Message-ID": decode_mime_words(msg.get("Message-ID", "")),
-        "New_Fetch": True # Default to True
+        "New_Fetch": True
     }
 
     # --- Standard Header Parsing (SPF, DKIM, Domain) ---
@@ -149,7 +155,6 @@ def parse_email_message(msg):
     if match_auth:
         data["Domain"] = match_auth.group(1).lower()
     else:
-        # Fallback: Extract from the 'From' header using robust regex
         from_header = decode_mime_words(msg.get('From', ''))
         match = re.search(r'<(?:.+@)?([\w\.-]+)>|@([\w\.-]+)$', from_header)
         if match:
@@ -191,9 +196,7 @@ def fetch_emails(start_date, end_date, mailbox="inbox"):
     """Fetch emails from a given mailbox based on date range (inclusive of start/end dates)."""
     results = []
     
-    # Format dates for IMAP
     start_date_str = start_date.strftime("%d-%b-%Y")
-    # IMAP SEARCH command needs a "BEFORE" date that is *the day after* the required end date
     day_after_end = end_date + datetime.timedelta(days=1)
     day_after_end_str = day_after_end.strftime("%d-%b-%Y")
     
@@ -204,10 +207,8 @@ def fetch_emails(start_date, end_date, mailbox="inbox"):
         imap.login(st.session_state.email_input, st.session_state.password_input)
         imap.select(mailbox)
 
-        # IMAP criteria for date range
         criteria = f'(SINCE {start_date_str} BEFORE {day_after_end_str})'
         
-        # Always fetch headers by UID for sorting/deduping
         status, data = imap.uid('search', None, criteria)
         uids = data[0].split()
 
@@ -219,10 +220,9 @@ def fetch_emails(start_date, end_date, mailbox="inbox"):
                     msg = email.message_from_bytes(response_part[1])
                     email_data = parse_email_message(msg)
                     email_data["Mailbox"] = "Inbox" if mailbox == "inbox" else "Spam"
-                    email_data["New_Fetch"] = True # Mark as new
+                    email_data["New_Fetch"] = True
                     results.append(email_data)
             
-            # Track the highest UID found for potential future use.
             if mailbox == "inbox":
                  new_last_uid = max(new_last_uid, uid_decoded) if new_last_uid else uid_decoded
 
@@ -241,18 +241,13 @@ def fetch_emails(start_date, end_date, mailbox="inbox"):
 def fetch_all_emails(start_date, end_date):
     """Fetch from Inbox and Spam together, avoiding duplicates."""
     
-    # Fetch data for the specified date range
     inbox_df, new_uid = fetch_emails(start_date, end_date, "inbox")
     spam_df, _ = fetch_emails(start_date, end_date, "[Gmail]/Spam") 
 
     combined_df = pd.concat([inbox_df, spam_df], ignore_index=True)
 
-    # Prepare existing data for merge: Mark all existing rows as 'old'
     if not st.session_state.df.empty:
-        # Safely assign 'False' to New_Fetch for old data
         st.session_state.df.loc[:, "New_Fetch"] = False 
-        
-        # Drop duplicates from the new fetch based on Message-ID
         seen_ids = set(st.session_state.df["Message-ID"].dropna())
         combined_df = combined_df[~combined_df["Message-ID"].isin(seen_ids)].copy()
 
@@ -262,7 +257,6 @@ def fetch_all_emails(start_date, end_date):
 
 def highlight_failed_auth(row):
     """Applies a light red background to rows where SPF, DKIM, or DMARC is not 'pass'."""
-    # Ensure columns exist before checking them 
     spf_status = row.get('SPF', '')
     dkim_status = row.get('DKIM', '')
     dmarc_status = row.get('DMARC', '')
@@ -271,13 +265,13 @@ def highlight_failed_auth(row):
              (dkim_status != 'pass') or \
              (dmarc_status != 'pass')
     
-    style = 'background-color: rgba(255, 0, 0, 0.2)' # Light red
+    style = 'background-color: rgba(255, 0, 0, 0.2)'
     return [style] * len(row) if failed else [''] * len(row)
 
 
 def highlight_main_table(row):
     """
-    Applies styling for both New Fetch (Light Blue) and Failed Auth (Light Red, prioritized).
+    Applies styling for both Failed Auth (Light Red, prioritized) and New Fetch (Light Blue).
     """
     # 1. Check for Failed Authentication (Highest Priority)
     spf_status = row.get('SPF', '')
@@ -289,13 +283,13 @@ def highlight_main_table(row):
              (dmarc_status != 'pass')
 
     if failed:
-        style = 'background-color: rgba(255, 0, 0, 0.2)' # Light Red
+        style = 'background-color: rgba(255, 0, 0, 0.2)'
         return [style] * len(row)
 
     # 2. Check for New Fetch (Lower Priority)
     is_new = row.get('New_Fetch', False) 
     if is_new:
-        style = 'background-color: rgba(0, 150, 255, 0.1)' # Light Blue
+        style = 'background-color: rgba(0, 150, 255, 0.1)'
         return [style] * len(row)
 
     # 3. Default (No Highlight)
@@ -306,10 +300,14 @@ def highlight_main_table(row):
 colA, colB = st.columns([1.5, 2])
 
 with colA:
-    date_range_label = f" ({START_DATE} to {END_DATE})"
+    # Update button label to dynamically reflect the selected range
+    if START_DATE == END_DATE:
+        date_range_label = f" (Today, {START_DATE})"
+    else:
+        date_range_label = f" ({START_DATE} to {END_DATE})"
+        
     if st.button(f"📥 Fetch Date Range {date_range_label}", help="Fetches ALL emails from Inbox and Spam within the selected date range and adds new unique emails to the table."):
         
-        # Reset new fetch markers on old data
         if not st.session_state.df.empty:
              st.session_state.df.loc[:, "New_Fetch"] = False
 
@@ -318,10 +316,7 @@ with colA:
             df_new, new_uid = fetch_all_emails(START_DATE, END_DATE)
             
             if not df_new.empty:
-                # Concatenate new data to old data
                 st.session_state.df = pd.concat([df_new, st.session_state.df], ignore_index=True)
-                
-                # Sort to put the new fetch data (New_Fetch=True) at the top
                 st.session_state.df = st.session_state.df.sort_values(
                     by='New_Fetch', 
                     ascending=False, 
@@ -339,7 +334,6 @@ with colB:
     spam_label = f" ({START_DATE} to {END_DATE})"
     if st.button(f"🗑️ Fetch Spam Folder {spam_label}", help="Fetches all unique spam emails within the selected date range."):
          
-         # Reset new fetch markers on old spam data
          if not st.session_state.spam_df.empty:
              st.session_state.spam_df.loc[:, "New_Fetch"] = False
 
@@ -368,7 +362,6 @@ inbox_cols = ["Subject", "Date", "Domain", "SPF", "DKIM", "DMARC", "Type", "Mail
 if not st.session_state.df.empty:
     display_df = st.session_state.df.reindex(columns=inbox_cols, fill_value="-")
     
-    # *** APPLY THE NEW COMBINED STYLING HERE ***
     styled_display_df = display_df.style.apply(highlight_main_table, axis=1)
     
     st.dataframe(styled_display_df, use_container_width=True)
@@ -384,10 +377,9 @@ if not st.session_state.df.empty:
     ]
 
     if not failed_df.empty:
-        st.subheader("❌ Failed Auth Emails (Redundant Table, Still Highlighted Red)")
+        st.subheader("❌ Failed Auth Emails")
         failed_cols = ["Subject", "Domain", "SPF", "DKIM", "DMARC", "Type", "Sub ID", "Mailbox"]
         
-        # Still apply the red styling for consistency and readability here
         styled_failed_df = failed_df[failed_cols].style.apply(
             highlight_failed_auth, 
             axis=1
@@ -403,7 +395,6 @@ if not st.session_state.spam_df.empty:
     spam_cols = ["Subject", "Date", "Domain", "Type", "Mailbox"]
     display_spam_df = st.session_state.spam_df.reindex(columns=spam_cols, fill_value="-")
     
-    # Apply the combined styling (since spam could also potentially fail auth, though less relevant)
     styled_spam_df = display_spam_df.style.apply(
         highlight_main_table, 
         axis=1
