@@ -197,9 +197,6 @@ def fetch_emails(start_date, end_date, mailbox="inbox"):
     day_after_end = end_date + datetime.timedelta(days=1)
     day_after_end_str = day_after_end.strftime("%d-%b-%Y")
     
-    # We will use the SINCE (start date) and BEFORE (day after end date) criteria.
-    # This fetches emails between start_date (inclusive) and end_date (inclusive).
-    
     new_last_uid = None 
     
     try:
@@ -225,8 +222,7 @@ def fetch_emails(start_date, end_date, mailbox="inbox"):
                     email_data["New_Fetch"] = True # Mark as new
                     results.append(email_data)
             
-            # Since we are not doing incremental fetch, last_uid is not strictly needed, 
-            # but we can track the highest UID found for potential future use.
+            # Track the highest UID found for potential future use.
             if mailbox == "inbox":
                  new_last_uid = max(new_last_uid, uid_decoded) if new_last_uid else uid_decoded
 
@@ -264,19 +260,9 @@ def fetch_all_emails(start_date, end_date):
 
 # --- Styling Functions ---
 
-def highlight_new_fetch(row):
-    """
-    Applies a distinct light blue background to rows from the current fetch.
-    FIXED: Uses .get() to avoid KeyError if 'New_Fetch' is somehow missing during styling.
-    """
-    # Use .get() to safely check for the 'New_Fetch' key
-    is_new = row.get('New_Fetch', False) 
-    style = 'background-color: rgba(0, 150, 255, 0.1)' # Light blue
-    return [style] * len(row) if is_new else [''] * len(row)
-
 def highlight_failed_auth(row):
     """Applies a light red background to rows where SPF, DKIM, or DMARC is not 'pass'."""
-    # Ensure columns exist before checking them (important for styling empty or filtered DFs)
+    # Ensure columns exist before checking them 
     spf_status = row.get('SPF', '')
     dkim_status = row.get('DKIM', '')
     dmarc_status = row.get('DMARC', '')
@@ -287,6 +273,34 @@ def highlight_failed_auth(row):
     
     style = 'background-color: rgba(255, 0, 0, 0.2)' # Light red
     return [style] * len(row) if failed else [''] * len(row)
+
+
+def highlight_main_table(row):
+    """
+    Applies styling for both New Fetch (Light Blue) and Failed Auth (Light Red, prioritized).
+    """
+    # 1. Check for Failed Authentication (Highest Priority)
+    spf_status = row.get('SPF', '')
+    dkim_status = row.get('DKIM', '')
+    dmarc_status = row.get('DMARC', '')
+
+    failed = (spf_status != 'pass') or \
+             (dkim_status != 'pass') or \
+             (dmarc_status != 'pass')
+
+    if failed:
+        style = 'background-color: rgba(255, 0, 0, 0.2)' # Light Red
+        return [style] * len(row)
+
+    # 2. Check for New Fetch (Lower Priority)
+    is_new = row.get('New_Fetch', False) 
+    if is_new:
+        style = 'background-color: rgba(0, 150, 255, 0.1)' # Light Blue
+        return [style] * len(row)
+
+    # 3. Default (No Highlight)
+    return [''] * len(row)
+
 
 # --- Action Buttons ---
 colA, colB = st.columns([1.5, 2])
@@ -314,7 +328,6 @@ with colA:
                     ignore_index=True
                 )
                 
-                # Update last_uid only if new_uid is available
                 if new_uid:
                     st.session_state.last_uid = new_uid
 
@@ -353,11 +366,10 @@ st.subheader("📬 Processed Emails")
 inbox_cols = ["Subject", "Date", "Domain", "SPF", "DKIM", "DMARC", "Type", "Mailbox"] 
 
 if not st.session_state.df.empty:
-    # Reindex to ensure order, filling missing values with "-"
     display_df = st.session_state.df.reindex(columns=inbox_cols, fill_value="-")
     
-    # Apply the new fetch styling (KeyError fix is in highlight_new_fetch)
-    styled_display_df = display_df.style.apply(highlight_new_fetch, axis=1)
+    # *** APPLY THE NEW COMBINED STYLING HERE ***
+    styled_display_df = display_df.style.apply(highlight_main_table, axis=1)
     
     st.dataframe(styled_display_df, use_container_width=True)
 else:
@@ -372,10 +384,10 @@ if not st.session_state.df.empty:
     ]
 
     if not failed_df.empty:
-        st.subheader("❌ Failed Auth Emails")
+        st.subheader("❌ Failed Auth Emails (Redundant Table, Still Highlighted Red)")
         failed_cols = ["Subject", "Domain", "SPF", "DKIM", "DMARC", "Type", "Sub ID", "Mailbox"]
         
-        # Apply the red failure styling (KeyError fix is in highlight_failed_auth)
+        # Still apply the red styling for consistency and readability here
         styled_failed_df = failed_df[failed_cols].style.apply(
             highlight_failed_auth, 
             axis=1
@@ -391,9 +403,9 @@ if not st.session_state.spam_df.empty:
     spam_cols = ["Subject", "Date", "Domain", "Type", "Mailbox"]
     display_spam_df = st.session_state.spam_df.reindex(columns=spam_cols, fill_value="-")
     
-    # Apply the new fetch styling
+    # Apply the combined styling (since spam could also potentially fail auth, though less relevant)
     styled_spam_df = display_spam_df.style.apply(
-        highlight_new_fetch, 
+        highlight_main_table, 
         axis=1
     )
     
