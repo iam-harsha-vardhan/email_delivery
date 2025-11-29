@@ -1,7 +1,6 @@
-# Streamlit app: Email HTML Extractor, De-encoder, and Clustering Zipper
-# Save as: streamlit_email_html_extractor.py
-# Requirements: pip install streamlit beautifulsoup4 lxml scikit-learn numpy pandas joblib
-# Optional: python-magic for better mime detection
+# streamlit_email_html_extractor.py
+# Requirements:
+# pip install streamlit beautifulsoup4 lxml scikit-learn numpy pandas joblib
 
 import streamlit as st
 import imaplib
@@ -34,11 +33,13 @@ and produce a final ZIP containing subfolders for each cluster.
 )
 
 # -------------------------
-# Connection / Folder UI
+# Sidebar connection / folder UI
 # -------------------------
-with st.form("connection_form"):
+with st.sidebar.form("connection_form"):
     st.header("Connection & source folders")
     imap_host = st.text_input("IMAP host (e.g. imap.gmail.com)", value="imap.gmail.com")
+    # Keep port hidden (default 993)
+    imap_port = 993
     email_user = st.text_input("Email (username)")
     app_password = st.text_input("App password / IMAP password", type="password")
 
@@ -46,38 +47,46 @@ with st.form("connection_form"):
     imap_folders = []
     if email_user and app_password and imap_host:
         try:
-            tmp_conn = imaplib.IMAP4_SSL(imap_host, 993)
+            tmp_conn = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=20)
             tmp_conn.login(email_user, app_password)
             res, flist = tmp_conn.list()
-            if res == 'OK':
-                for f in flist:
+            if res == 'OK' and flist:
+                for entry in flist:
                     try:
-                        decoded = f.decode()
-                        m = re.search(r'"(.+)"$', decoded)
+                        s = entry.decode(errors='ignore').strip()
+                        # typical formats: '(\HasNoChildren) "/" "INBOX"'  OR  '(\HasNoChildren) "/" INBOX'
+                        m = re.search(r'\"([^\"]+)\"$', s)
                         if m:
                             name = m.group(1)
                         else:
-                            parts = decoded.split()
-                            name = parts[-1]
-                        imap_folders.append(name)
+                            parts = s.split()
+                            name = parts[-1].strip('"')
+                        if name and name not in imap_folders:
+                            imap_folders.append(name)
                     except Exception:
                         continue
+            else:
+                # show raw result for debugging (helps adapt to provider formats)
+                st.text_area("IMAP list raw (debug)", value=str(flist), height=100)
             tmp_conn.logout()
-        except Exception:
-            # ignore listing errors (some providers return odd formats)
+        except Exception as e:
+            st.warning("Folder listing failed. Check credentials or provider IMAP LIST support.")
+            st.text_area("IMAP list error (debug)", value=str(e), height=120)
             imap_folders = []
 
+    # fallback common folders if listing couldn't find anything
+    if not imap_folders:
+        imap_folders = ["INBOX", "Sent", "Drafts", "Trash", "Spam"]
+
     mail_folders = st.multiselect(
-        "Select folders to include (INBOX, Trash, Spam, custom labels)",
-        options=imap_folders or ["INBOX"],
+        "Select folders to include (choose one or many)",
+        options=imap_folders,
         default=["INBOX"]
     )
 
     show_advanced = st.checkbox("Show advanced settings")
 
     if show_advanced:
-        # advanced controls
-        imap_port = st.number_input("IMAP port", value=993)
         max_messages = st.number_input("Max messages to fetch (0 = all)", min_value=0, value=0)
         workers = st.number_input("Parallel workers (instances)", min_value=1, max_value=64, value=4)
         cluster_mode = st.selectbox("Clustering mode", ["Fixed clusters (n)", "Distance threshold"], index=0)
@@ -89,13 +98,13 @@ with st.form("connection_form"):
             n_clusters = None
     else:
         # simplified defaults
-        imap_port = 993
         max_messages = 1000
         workers = 4
         cluster_mode = 'Fixed clusters (n)'
         n_clusters = 10
         distance_threshold = None
 
+    search_query = st.text_input("IMAP search query (e.g. ALL, UNSEEN, SINCE 01-Jan-2024)", value="ALL")
     submit = st.form_submit_button("Start extraction & clustering")
 
 # -------------------------
@@ -219,6 +228,7 @@ def chunkify(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
+
 # -------------------------
 # Main execution
 # -------------------------
@@ -247,8 +257,7 @@ if submit:
                 except Exception:
                     continue
 
-            # sort uids (as bytes) and get most recent if needed
-            # some servers return non-numeric uids; we try-except to remain robust
+            # try to sort numeric uids; if not numeric, keep order
             try:
                 all_uids = sorted(all_uids, key=lambda x: int(x))
             except Exception:
