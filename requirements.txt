@@ -1,3 +1,9 @@
 streamlit
 pandas
 pytz
+beautifulsoup4
+lxml
+scikit-learn
+numpy
+pandas
+joblib
