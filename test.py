@@ -18,6 +18,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import AgglomerativeClustering
 import uuid
 from pathlib import Path
+import time
 
 st.set_page_config(page_title="Email HTML Extractor & Cluster Zipper", layout="wide")
 st.title("Email HTML Extractor — decode, cluster, zip")
@@ -55,7 +56,7 @@ with st.sidebar.form("connection_form"):
                     try:
                         s = entry.decode(errors='ignore').strip()
                         # typical formats: '(\HasNoChildren) "/" "INBOX"'  OR  '(\HasNoChildren) "/" INBOX'
-                        m = re.search(r'\"([^\"]+)\"$', s)
+                        m = re.search(r'"([^"]+)"$', s)
                         if m:
                             name = m.group(1)
                         else:
@@ -87,8 +88,8 @@ with st.sidebar.form("connection_form"):
     show_advanced = st.checkbox("Show advanced settings")
 
     if show_advanced:
-        max_messages = st.number_input("Max messages to fetch (0 = all)", min_value=0, value=0)
-        workers = st.number_input("Parallel workers (instances)", min_value=1, max_value=64, value=4)
+        max_messages = st.number_input("Max messages to fetch (0 = all)", min_value=0, value=5000)
+        workers = st.number_input("Parallel workers (instances)", min_value=1, max_value=32, value=1)
         cluster_mode = st.selectbox("Clustering mode", ["Fixed clusters (n)", "Distance threshold"], index=0)
         if cluster_mode == "Fixed clusters (n)":
             n_clusters = st.number_input("Number of clusters (n)", min_value=1, value=10)
@@ -97,9 +98,9 @@ with st.sidebar.form("connection_form"):
             distance_threshold = st.number_input("Linkage distance threshold (smaller = more clusters)", min_value=0.0, value=1.5, step=0.1)
             n_clusters = None
     else:
-        # simplified defaults
-        max_messages = 1000
-        workers = 4
+        # simplified defaults (safe for <5k mailboxes)
+        max_messages = 5000
+        workers = 1
         cluster_mode = 'Fixed clusters (n)'
         n_clusters = 10
         distance_threshold = None
@@ -186,47 +187,82 @@ def clean_for_vector(text):
     return txt
 
 
-def fetch_message_by_uid(imap, uid):
-    res, data = imap.uid('fetch', uid, '(RFC822)')
+def fetch_message_by_uid(imap_conn, uid):
+    res, data = imap_conn.uid('fetch', uid, '(RFC822)')
     if res != 'OK':
         return None
     return data[0][1]
 
 
-def process_uids_segment(uids, folders, imap_host, imap_port, user, pwd):
-    """Connects, fetches and extracts html parts for a segment of uids across given folders."""
+def process_uids_segment_sequential(uids, folders, imap_host, imap_port, user, pwd, progress_cb=None):
+    """
+    Sequential fetching across folders (used when workers=1 to enable per-message progress updates).
+    progress_cb(uid, folder, index, total) is optional callback to report progress.
+    """
     results = []
-    try:
-        imap = imaplib.IMAP4_SSL(imap_host, imap_port)
-        imap.login(user, pwd)
+    imap = imaplib.IMAP4_SSL(imap_host, imap_port)
+    imap.login(user, pwd)
+    total = len(uids)
+    counter = 0
+    for uid in uids:
+        counter += 1
         for f in folders:
             try:
                 imap.select(f)
             except Exception:
                 continue
-            for uid in uids:
-                try:
-                    raw = fetch_message_by_uid(imap, uid)
-                    if not raw:
-                        continue
-                    parts = extract_html_and_css_from_message(raw)
-                    if parts:
-                        results.append({'uid': uid, 'folder': f, 'parts': parts})
-                except Exception:
-                    continue
+            raw = fetch_message_by_uid(imap, uid)
+            if not raw:
+                continue
+            parts = extract_html_and_css_from_message(raw)
+            if parts:
+                results.append({'uid': uid, 'folder': f, 'parts': parts})
+        if progress_cb:
+            progress_cb(uid, f if 'f' in locals() else 'unknown', counter, total)
+    try:
+        imap.logout()
+    except Exception:
+        pass
+    return {'error': None, 'data': results}
+
+
+def process_uids_segment_parallel(uids, folders, imap_host, imap_port, user, pwd):
+    """
+    Worker function used by ThreadPoolExecutor: each worker opens its own IMAP connection and processes its chunk.
+    Returns {'error': str or None, 'data': [...]}
+    """
+    try:
+        imap = imaplib.IMAP4_SSL(imap_host, imap_port)
+        imap.login(user, pwd)
     except Exception as e:
         return {'error': str(e), 'data': []}
-    finally:
-        try:
-            imap.logout()
-        except Exception:
-            pass
+
+    results = []
+    for uid in uids:
+        for f in folders:
+            try:
+                imap.select(f)
+            except Exception:
+                continue
+            raw = fetch_message_by_uid(imap, uid)
+            if not raw:
+                continue
+            parts = extract_html_and_css_from_message(raw)
+            if parts:
+                results.append({'uid': uid, 'folder': f, 'parts': parts})
+    try:
+        imap.logout()
+    except Exception:
+        pass
     return {'error': None, 'data': results}
 
 
 def chunkify(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+    if n <= 0:
+        yield lst
+    else:
+        for i in range(0, len(lst), n):
+            yield lst[i:i+n]
 
 
 # -------------------------
@@ -238,108 +274,128 @@ if submit:
     else:
         tmpdir = Path(tempfile.mkdtemp(prefix='email_html_extract_'))
         st.info(f"Working directory: {tmpdir}")
-        progress_bar = st.progress(0)
+        main_progress = st.progress(0)
         status = st.empty()
+        fetch_status = st.empty()   # for per-message status line
 
         try:
-            imap = imaplib.IMAP4_SSL(imap_host, imap_port)
-            imap.login(email_user, app_password)
+            # open a quick connection to collect UIDs across selected folders
+            imap_root = imaplib.IMAP4_SSL(imap_host, imap_port)
+            imap_root.login(email_user, app_password)
 
-            # gather uids across selected folders
             all_uids = []
             for f in mail_folders:
                 try:
-                    imap.select(f)
-                    res, data = imap.uid('search', None, 'ALL')
+                    imap_root.select(f)
+                    res, data = imap_root.uid('search', None, search_query)
                     if res == 'OK':
                         uids = data[0].split()
                         all_uids.extend(uids)
-                except Exception:
+                except Exception as e:
+                    st.warning(f"Could not search folder {f}: {e}")
                     continue
 
-            # try to sort numeric uids; if not numeric, keep order
             try:
                 all_uids = sorted(all_uids, key=lambda x: int(x))
             except Exception:
-                all_uids = all_uids
+                # leave order as returned if not numeric
+                pass
 
             if max_messages and int(max_messages) > 0 and len(all_uids) > int(max_messages):
+                # keep most recent messages
                 all_uids = all_uids[-int(max_messages):]
 
             total = len(all_uids)
-            status.write(f"Found {total} messages across folders. Processing with {workers} workers...")
-
-            # split uids into worker chunks
-            chunk_size = max(1, int(len(all_uids)//workers)) if workers > 0 else len(all_uids)
-            chunks = list(chunkify(all_uids, chunk_size)) or [all_uids]
-
-            extracted = []
-            processed_chunks = 0
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = [executor.submit(process_uids_segment, chunk, mail_folders, imap_host, imap_port, email_user, app_password) for chunk in chunks]
-                for fut in as_completed(futures):
-                    resobj = fut.result()
-                    if resobj.get('error'):
-                        st.warning('Worker error: ' + resobj['error'])
-                    for item in resobj['data']:
-                        extracted.append(item)
-                    processed_chunks += 1
-                    progress_bar.progress(min(100, int(processed_chunks/max(1, len(chunks))*100)))
-
-            st.write(f"Extracted HTML parts from {len(extracted)} messages (messages that had HTML).")
-
-            # flatten parts into files
-            file_records = []
-            for msg in extracted:
-                uid = msg['uid'].decode() if isinstance(msg['uid'], bytes) else str(msg['uid'])
-                folder = msg.get('folder', 'unknown')
-                for idx, part in enumerate(msg['parts']):
-                    fid = f"{folder}_{uid}_{idx}_{uuid.uuid4().hex[:6]}"
-                    html_name = tmpdir / f"{fid}.html"
-                    css_name = tmpdir / f"{fid}.css"
-                    html_text = part['html']
-                    css_text = part['css'] or ''
-                    html_name.write_text(html_text, encoding='utf-8')
-                    css_name.write_text(css_text, encoding='utf-8')
-                    file_records.append({'uid': uid, 'folder': folder, 'index': idx, 'html_path': str(html_name), 'css_path': str(css_name), 'html_text': html_text})
-
-            st.write(f"Saved {len(file_records)} html parts to disk.")
-
-            # clustering
-            st.write("Preparing documents for similarity clustering...")
-            docs = [clean_for_vector(r['html_text']) for r in file_records]
-            if len(docs) == 0:
-                st.error('No HTML documents to cluster.')
+            if total == 0:
+                st.info("No messages found for selected folders / query.")
             else:
-                vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,3), stop_words='english')
-                X = vectorizer.fit_transform(docs)
+                status.write(f"Found {total} messages across folders. Fetching with {workers} worker(s)...")
 
-                if cluster_mode == 'Fixed clusters (n)':
-                    ncl = min(int(n_clusters), len(docs))
-                    model = AgglomerativeClustering(n_clusters=ncl, affinity='euclidean', linkage='ward')
+                extracted = []
+                if workers == 1:
+                    # sequential mode -> per-message progress updates
+                    def progress_cb(uid, folder, idx, total_count):
+                        pct = int((idx / float(total_count)) * 100)
+                        main_progress.progress(pct)
+                        fetch_status.markdown(f"Fetching UID: `{uid.decode() if isinstance(uid, bytes) else uid}`  — folder: `{folder}`  — {idx}/{total_count}")
+
+                    # do sequential fetch so we can show fine-grained progress
+                    resobj = process_uids_segment_sequential(all_uids, mail_folders, imap_host, imap_port, email_user, app_password, progress_cb=progress_cb)
+                    if resobj.get('error'):
+                        st.warning("Fetch error: " + resobj['error'])
+                    extracted = resobj.get('data', [])
+                    main_progress.progress(100)
                 else:
-                    model = AgglomerativeClustering(n_clusters=None, distance_threshold=float(distance_threshold), affinity='euclidean', linkage='ward')
+                    # parallel mode: split into chunks, show chunk completion progress
+                    chunk_size = max(1, int(len(all_uids) // workers))
+                    chunks = list(chunkify(all_uids, chunk_size))
+                    processed_chunks = 0
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = [executor.submit(process_uids_segment_parallel, chunk, mail_folders, imap_host, imap_port, email_user, app_password) for chunk in chunks]
+                        for fut in as_completed(futures):
+                            resobj = fut.result()
+                            if resobj.get('error'):
+                                st.warning("Worker error: " + resobj['error'])
+                            extracted.extend(resobj.get('data', []))
+                            processed_chunks += 1
+                            main_progress.progress(int(processed_chunks / max(1, len(chunks)) * 100))
+                            fetch_status.write(f"Completed chunk {processed_chunks}/{len(chunks)}")
+                    main_progress.progress(100)
 
-                labels = model.fit_predict(X.toarray())
+                st.write(f"Extracted HTML parts from {len(extracted)} messages (messages that had HTML).")
 
-                clusters = {}
-                for rec, lab in zip(file_records, labels):
-                    clusters.setdefault(int(lab), []).append(rec)
+                # flatten parts into files
+                file_records = []
+                for msg in extracted:
+                    uid = msg['uid'].decode() if isinstance(msg['uid'], bytes) else str(msg['uid'])
+                    folder = msg.get('folder', 'unknown')
+                    for idx, part in enumerate(msg['parts']):
+                        fid = f"{folder}_{uid}_{idx}_{uuid.uuid4().hex[:6]}"
+                        html_name = tmpdir / f"{fid}.html"
+                        css_name = tmpdir / f"{fid}.css"
+                        html_text = part['html']
+                        css_text = part['css'] or ''
+                        html_name.write_text(html_text, encoding='utf-8')
+                        css_name.write_text(css_text, encoding='utf-8')
+                        file_records.append({'uid': uid, 'folder': folder, 'index': idx, 'html_path': str(html_name), 'css_path': str(css_name), 'html_text': html_text})
 
-                out_zip_path = tmpdir / f"email_templates_clusters_{uuid.uuid4().hex[:8]}.zip"
-                with zipfile.ZipFile(out_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for lab, items in clusters.items():
-                        folder_name = f"cluster_{lab}"
-                        for it in items:
-                            arc_html = str(Path(folder_name) / Path(it['html_path']).name)
-                            zf.write(it['html_path'], arc_html)
-                            if os.path.exists(it['css_path']) and Path(it['css_path']).stat().st_size > 0:
-                                arc_css = str(Path(folder_name) / Path(it['css_path']).name)
-                                zf.write(it['css_path'], arc_css)
+                st.write(f"Saved {len(file_records)} html parts to disk.")
 
-                st.success(f"Created ZIP with {len(clusters)} clusters: {out_zip_path}")
-                with open(out_zip_path, 'rb') as fh:
-                    st.download_button(label='Download clustered ZIP', data=fh.read(), file_name=out_zip_path.name)
+                # clustering
+                st.write("Preparing documents for similarity clustering...")
+                docs = [clean_for_vector(r['html_text']) for r in file_records]
+                if len(docs) == 0:
+                    st.error('No HTML documents to cluster.')
+                else:
+                    vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,3), stop_words='english')
+                    X = vectorizer.fit_transform(docs)
+
+                    if cluster_mode == 'Fixed clusters (n)':
+                        ncl = min(int(n_clusters), len(docs))
+                        model = AgglomerativeClustering(n_clusters=ncl, affinity='euclidean', linkage='ward')
+                    else:
+                        model = AgglomerativeClustering(n_clusters=None, distance_threshold=float(distance_threshold), affinity='euclidean', linkage='ward')
+
+                    labels = model.fit_predict(X.toarray())
+
+                    clusters = {}
+                    for rec, lab in zip(file_records, labels):
+                        clusters.setdefault(int(lab), []).append(rec)
+
+                    out_zip_path = tmpdir / f"email_templates_clusters_{uuid.uuid4().hex[:8]}.zip"
+                    with zipfile.ZipFile(out_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        for lab, items in clusters.items():
+                            folder_name = f"cluster_{lab}"
+                            for it in items:
+                                arc_html = str(Path(folder_name) / Path(it['html_path']).name)
+                                zf.write(it['html_path'], arc_html)
+                                if os.path.exists(it['css_path']) and Path(it['css_path']).stat().st_size > 0:
+                                    arc_css = str(Path(folder_name) / Path(it['css_path']).name)
+                                    zf.write(it['css_path'], arc_css)
+
+                    st.success(f"Created ZIP with {len(clusters)} clusters: {out_zip_path}")
+                    with open(out_zip_path, 'rb') as fh:
+                        st.download_button(label='Download clustered ZIP', data=fh.read(), file_name=out_zip_path.name)
 
         except Exception as e:
             st.exception(e)
