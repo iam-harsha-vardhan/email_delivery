@@ -1,459 +1,429 @@
-# streamlit_email_html_extractor.py
-# Requirements:
-# pip install streamlit beautifulsoup4 lxml scikit-learn numpy pandas joblib
-
 import streamlit as st
 import imaplib
 import email
-import quopri
-import base64
+from email.header import decode_header
+import datetime
 import re
-import os
-import json
-import time
-import tempfile
-import shutil
-import zipfile
-from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import AgglomerativeClustering
-import uuid
-from pathlib import Path
+import pandas as pd
+import pytz
+import base64
+import binascii
 
-st.set_page_config(page_title="Email HTML Extractor (batched + checkpoint)", layout="wide")
-st.title("Email HTML Extractor — batched fetch, checkpointing, cluster & zip")
+# ---------- Page Setup ----------
+st.set_page_config(page_title="Dynamic Multi-Account Inbox", layout="wide")
+st.title("📧 Dynamic Multi-Account Inbox Comparator")
 
-st.markdown("""
-Fetch emails in safe batches, decode HTML parts, checkpoint intermediate results so runs can resume after interruptions,
-then cluster templates and produce a ZIP with subfolders per cluster.
-""")
+# ---------- Robust Session State Initialization ----------
+if "creds_df" not in st.session_state:
+    st.session_state.creds_df = pd.DataFrame([{"Email": "", "Password": ""}])
 
-# -------------------------
-# Sidebar / connection UI
-# -------------------------
-with st.sidebar.form("conn"):
-    st.header("Connection & options")
-    imap_host = st.text_input("IMAP host", value="imap.gmail.com")
-    email_user = st.text_input("Email (username)")
-    app_password = st.text_input("App password / IMAP password", type="password")
+if "mailbox_data" not in st.session_state:
+    st.session_state.mailbox_data = {}
 
-    # folders
-    imap_folders = []
-    if email_user and app_password and imap_host:
-        try:
-            tconn = imaplib.IMAP4_SSL(imap_host, 993, timeout=20)
-            tconn.login(email_user, app_password)
-            res, flist = tconn.list()
-            if res == 'OK' and flist:
-                for e in flist:
-                    try:
-                        s = e.decode(errors='ignore').strip()
-                        m = re.search(r'"([^"]+)"$', s)
-                        if m:
-                            name = m.group(1)
-                        else:
-                            parts = s.split()
-                            name = parts[-1].strip('"')
-                        if name not in imap_folders:
-                            imap_folders.append(name)
-                    except Exception:
-                        continue
-            tconn.logout()
-        except Exception:
-            imap_folders = []
-    if not imap_folders:
-        imap_folders = ["INBOX", "Sent", "Drafts", "Trash", "Spam"]
+def get_empty_mailbox_structure():
+    return {
+        "last_uid": None,
+        "df": pd.DataFrame(columns=["UID", "Domain", "Subject", "From", "Message-ID", "Sub ID", "Type", "SPF", "DKIM", "DMARC", "is_new"])
+    }
 
-    mail_folders = st.multiselect("Folders to include", options=imap_folders, default=["INBOX"])
-
-    batch_size = st.number_input("Batch size (messages per batch)", min_value=50, max_value=5000, value=200, step=50)
-    workers = st.number_input("Workers per batch (parallel fetch within batch)", min_value=1, max_value=16, value=1)
-    max_messages = st.number_input("Max total messages to fetch (0 = all)", min_value=0, value=0)
-
-    cluster_mode = st.selectbox("Clustering mode", ["Fixed clusters (n)", "Distance threshold"])
-    if cluster_mode == "Fixed clusters (n)":
-        n_clusters = st.number_input("Number of clusters (n)", min_value=1, value=10)
-        distance_threshold = None
-    else:
-        distance_threshold = st.number_input("Linkage distance threshold", min_value=0.0, value=1.5, step=0.1)
-        n_clusters = None
-
-    max_retries = st.number_input("Login max retries (per worker)", min_value=0, max_value=10, value=3)
-    base_retry_delay = st.number_input("Base retry delay (sec)", min_value=1, max_value=60, value=5)
-
-    # checkpoint controls
-    resume_available = False
-    checkpoint_root = Path.cwd() / "email_extractor_checkpoints"
-    # find latest checkpoint (if any)
-    runs = sorted([p for p in checkpoint_root.iterdir()] if checkpoint_root.exists() else [], key=lambda x: x.stat().st_mtime, reverse=True)
-    latest_run = runs[0] if runs else None
-    if latest_run and (latest_run / "checkpoint.jsonl").exists():
-        resume_available = True
-        st.write(f"Found checkpoint: {latest_run.name}")
-        resume_from_checkpoint = st.checkbox("Resume from latest checkpoint", value=False)
-        if resume_from_checkpoint:
-            resume_path = latest_run
-        else:
-            if st.button("Clear latest checkpoint"):
-                try:
-                    shutil.rmtree(latest_run)
-                    st.success("Cleared latest checkpoint folder.")
-                    resume_available = False
-                    latest_run = None
-                except Exception as e:
-                    st.error(f"Failed to remove checkpoint: {e}")
-                    resume_available = True
-    else:
-        resume_from_checkpoint = False
-
-    submit = st.form_submit_button("Start")
-
-# -------------------------
-# Helpers
-# -------------------------
-CLEAN_RE_PATTERNS = [
-    (re.compile(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+"), ""),
-    (re.compile(r"https?://\S+"), ""),
-    (re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+"), ""),
-    (re.compile(r"\b[0-9a-f]{8,}\b", re.IGNORECASE), ""),
-]
-
-def decode_part(part):
-    content = part.get_payload(decode=False)
-    cte = (part.get('Content-Transfer-Encoding') or '').lower()
-    try:
-        if cte == 'base64':
-            decoded = base64.b64decode(content)
-        elif cte in ('quoted-printable', 'quopri'):
-            decoded = quopri.decodestring(content)
-        else:
-            decoded = part.get_payload(decode=True)
-            if decoded is None:
-                decoded = content.encode('utf-8', errors='ignore') if isinstance(content, str) else content
-    except Exception:
-        decoded = content if isinstance(content, bytes) else str(content).encode('utf-8', errors='ignore')
-    return decoded
-
-def extract_html_and_css_from_message(msg_bytes):
-    try:
-        msg = email.message_from_bytes(msg_bytes)
-    except Exception:
-        return []
-    results = []
-    for part in msg.walk():
-        ctype = part.get_content_type()
-        try:
-            payload = part.get_payload(decode=True) or b''
-            payload_text = payload.decode(part.get_content_charset() or 'utf-8', errors='ignore') if isinstance(payload, (bytes, bytearray)) else str(payload)
-        except Exception:
-            payload_text = ''
-        if ctype == 'text/html' or (ctype == 'text/plain' and '<html' in payload_text.lower()):
-            decoded = decode_part(part)
-            if not decoded:
-                continue
+# ---------- Utilities ----------
+def decode_mime_words(s):
+    if not s: return ""
+    decoded = ''
+    for word, enc in decode_header(s):
+        if isinstance(word, bytes):
             try:
-                html = decoded.decode(part.get_content_charset() or 'utf-8', errors='ignore') if isinstance(decoded, (bytes, bytearray)) else str(decoded)
+                if enc and enc.lower() not in ["unknown-8bit", "x-unknown"]:
+                    decoded += word.decode(enc, errors="ignore")
+                else:
+                    decoded += word.decode("utf-8", errors="ignore")
             except Exception:
-                html = decoded.decode('utf-8', errors='ignore') if isinstance(decoded, (bytes, bytearray)) else str(decoded)
-            soup = BeautifulSoup(html, 'lxml')
-            styles = ''.join([s.get_text() for s in soup.find_all('style')])
-            for tag in soup.find_all(['script']):
-                tag.decompose()
-            for t in soup.find_all(True):
-                if t.has_attr('src'): del t['src']
-                if t.has_attr('href'): del t['href']
-                if t.has_attr('id'): del t['id']
-                if t.has_attr('class'): del t['class']
-            cleaned_html = str(soup)
-            results.append({'html': cleaned_html, 'css': styles})
-    return results
+                decoded += word.decode("utf-8", errors="ignore")
+        else:
+            decoded += word
+    return decoded.strip()
 
-def clean_for_vector(text):
-    txt = text.lower()
-    for pat, repl in CLEAN_RE_PATTERNS:
-        txt = pat.sub(repl, txt)
-    txt = re.sub(r'\s+', ' ', txt)
-    return txt
+def extract_domain_from_address(address):
+    if not address: return "-"
+    m = re.search(r'@([\w\.-]+)', address)
+    return m.group(1).lower() if m else "-"
 
-def fetch_message_by_uid_with_retry(imap_conn, uid):
-    try:
-        res, data = imap_conn.uid('fetch', uid, '(RFC822)')
-        if res != 'OK':
-            return None
-        return data[0][1]
-    except Exception:
+def extract_auth_results_from_headers(msg):
+    auth_header = msg.get("Authentication-Results", "") or " ".join(f"{h}: {v}" for h, v in msg.items())
+    spf = dkim = dmarc = 'neutral'
+    m_spf = re.search(r'spf=(\w+)', auth_header, re.I)
+    m_dkim = re.search(r'dkim=(\w+)', auth_header, re.I)
+    m_dmarc = re.search(r'dmarc=(\w+)', auth_header, re.I)
+    if m_spf: spf = m_spf.group(1).lower()
+    if m_dkim: dkim = m_dkim.group(1).lower()
+    if m_dmarc: dmarc = m_dmarc.group(1).lower()
+    return spf, dkim, dmarc
+
+# ---------- Sub-ID Extraction Logic ----------
+ID_RE = re.compile(r'\b(GRM-[A-Za-z0-9\-]+|GMFP-[A-Za-z0-9\-]+|GTC-[A-Za-z0-9\-]+|GRTC-[A-Za-z0-9\-]+)\b', re.I)
+
+def map_id_to_type(sub_id):
+    if not sub_id: return "-"
+    lid = sub_id.lower()
+    if lid.startswith('grm'):
+        return 'FPR'
+    if lid.startswith('gmfp'):
+        return 'FP'
+    if lid.startswith('gtc'):
+        return 'FPTC'
+    if lid.startswith('grtc'):
+        return 'FPRTC'
+    return "-"
+
+def try_base64_variants(s):
+    if not s or len(s) < 4:
         return None
-
-def login_with_retry(imap_host, imap_port, user, pwd, max_retries=3, base_delay=5):
-    attempt = 0
-    backoff = base_delay
-    while True:
-        try:
-            conn = imaplib.IMAP4_SSL(imap_host, imap_port)
-            conn.login(user, pwd)
-            return conn, None
-        except Exception as e:
-            attempt += 1
-            if attempt > max_retries:
-                return None, str(e)
-            time.sleep(backoff)
-            backoff *= 2
-
-def chunkify_list(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-# -------------------------
-# Checkpoint helpers
-# -------------------------
-def make_checkpoint_dir():
-    ck_root = Path.cwd() / "email_extractor_checkpoints"
-    ck_root.mkdir(parents=True, exist_ok=True)
-    run_dir = ck_root / time.strftime("%Y%m%d_%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=False)
-    return run_dir
-
-def load_latest_checkpoint(path):
-    # path is Path to run_dir
-    ckfile = path / "checkpoint.jsonl"
-    fetched_file = path / "fetched_uids.txt"
-    items = []
-    fetched = set()
-    if ckfile.exists():
-        with ckfile.open('r', encoding='utf-8') as fh:
-            for line in fh:
+    s = s.strip()
+    if s.startswith('<') and s.endswith('>'):
+        s = s[1:-1]
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        for pad in range(0, 4):
+            try:
+                candidate = s + ('=' * pad)
+                decoded = decoder(candidate)
                 try:
-                    items.append(json.loads(line))
+                    text = decoded.decode('utf-8', errors='ignore')
                 except Exception:
                     continue
-    if fetched_file.exists():
-        with fetched_file.open('r', encoding='utf-8') as fh:
-            for ln in fh:
-                fetched.add(ln.strip())
-    return items, fetched
+                if text and len(text.strip()) > 0:
+                    return text
+            except (binascii.Error, ValueError):
+                continue
+    return None
 
-def append_checkpoint_item(run_dir, item):
-    ckfile = run_dir / "checkpoint.jsonl"
-    with ckfile.open('a', encoding='utf-8') as fh:
-        fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+def find_subid_in_text(text):
+    if not text:
+        return None
+    m = ID_RE.search(text)
+    if m:
+        return m.group(1)
+    return None
 
-def append_fetched_uid(run_dir, uid):
-    f = run_dir / "fetched_uids.txt"
-    with f.open('a', encoding='utf-8') as fh:
-        fh.write(f"{uid}\n")
-
-# -------------------------
-# Main logic: start when user clicks Start
-# -------------------------
-if submit:
-    if not (imap_host and email_user and app_password and mail_folders):
-        st.error("Provide IMAP host, email, password and select at least one folder.")
-    else:
-        # Prepare checkpointing
-        if resume_from_checkpoint and latest_run:
-            run_dir = latest_run
-            st.info(f"Resuming from checkpoint: {run_dir}")
-            extracted_items, fetched_uids = load_latest_checkpoint(run_dir)
-        else:
-            # new run
-            run_dir = make_checkpoint_dir()
-            extracted_items = []
-            fetched_uids = set()
-
-        tmpdir = Path(tempfile.mkdtemp(prefix='email_html_extract_'))
-        st.info(f"Working dir: {tmpdir}")
-        batch_progress = st.progress(0)
-        message_status = st.empty()
-        overall_status = st.empty()
-
-        # gather UIDs across folders
-        try:
-            conn_root, err = login_with_retry(imap_host, 993, email_user, app_password, max_retries=int(max_retries), base_delay=int(base_retry_delay))
-            if conn_root is None:
-                st.error(f"Initial login failed: {err}")
-                raise SystemExit
-        except Exception as e:
-            st.error(f"Initial login exception: {e}")
-            raise SystemExit
-
-        all_uids = []
-        for f in mail_folders:
-            try:
-                conn_root.select(f)
-                res, data = conn_root.uid('search', None, 'ALL')
-                if res == 'OK':
-                    uids = data[0].split()
-                    all_uids.extend(uids)
-            except Exception as e:
-                st.warning(f"Could not search folder {f}: {e}")
-
-        try:
-            conn_root.logout()
-        except Exception:
-            pass
-
-        # optionally skip already fetched UIDs from checkpoint
-        all_uids = [u for u in all_uids if (u.decode() if isinstance(u, bytes) else str(u)) not in fetched_uids]
-
-        # sort numeric if possible
-        try:
-            all_uids = sorted(all_uids, key=lambda x: int(x))
-        except Exception:
-            pass
-
-        if max_messages and int(max_messages) > 0 and len(all_uids) > int(max_messages):
-            all_uids = all_uids[-int(max_messages):]
-
-        total_messages = len(all_uids)
-        if total_messages == 0:
-            st.info("No new messages to fetch (after checkpoint filter).")
-        else:
-            overall_status.write(f"Found {total_messages} messages to fetch (excluding already fetched). Batching by {batch_size}...")
-
-            batches = list(chunkify_list(all_uids, int(batch_size)))
-            n_batches = len(batches)
-            all_extracted = extracted_items[:]  # start with any previously checkpointed items
-
-            for bi, batch in enumerate(batches, start=1):
-                batch_status = f"Batch {bi}/{n_batches} ({len(batch)} messages)"
-                overall_status.write(batch_status)
-                message_progress = st.progress(0)
-                message_line = st.empty()
-
-                # sequential fetch with per-message updates if workers == 1
-                if int(workers) == 1:
-                    # one persistent connection with retries
-                    conn, err = login_with_retry(imap_host, 993, email_user, app_password, max_retries=int(max_retries), base_delay=int(base_retry_delay))
-                    if conn is None:
-                        st.error(f"Login failed for batch {bi}: {err}")
-                        break
-
-                    total_in_batch = len(batch)
-                    for idx, uid in enumerate(batch, start=1):
-                        for f in mail_folders:
-                            try:
-                                conn.select(f)
-                            except Exception:
-                                continue
-                            raw = fetch_message_by_uid_with_retry(conn, uid)
-                            if raw:
-                                parts = extract_html_and_css_from_message(raw)
-                                if parts:
-                                    for p in parts:
-                                        # item structure saved to checkpoint
-                                        item = {'uid': (uid.decode() if isinstance(uid, bytes) else str(uid)), 'folder': f, 'html': p['html'], 'css': p.get('css', '')}
-                                        # append to checkpoint file immediately
-                                        append_checkpoint_item(run_dir, item)
-                                        append_fetched_uid(run_dir, item['uid'])
-                                        all_extracted.append(item)
-                        pct = int((idx/total_in_batch)*100)
-                        message_progress.progress(pct)
-                        message_line.markdown(f"Fetched UID `{uid.decode() if isinstance(uid, bytes) else uid}` — {idx}/{total_in_batch}")
+def extract_subid_from_msg(msg):
+    # 1) Message-ID header tokens
+    msg_id_raw = decode_mime_words(msg.get("Message-ID", "") or msg.get("Message-Id", "") or "")
+    if msg_id_raw:
+        tokens = re.split(r'[_\s]+', msg_id_raw)
+        for token in tokens:
+            maybe = find_subid_in_text(token)
+            if maybe:
+                return maybe, map_id_to_type(maybe)
+            decoded = try_base64_variants(token)
+            if decoded:
+                maybe2 = find_subid_in_text(decoded)
+                if maybe2:
+                    return maybe2, map_id_to_type(maybe2)
+    # 2) All headers combined
+    headers_str = " ".join(f"{h}:{v}" for h, v in msg.items())
+    maybe = find_subid_in_text(headers_str)
+    if maybe:
+        return maybe, map_id_to_type(maybe)
+    # 3) Walk payloads
+    try:
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            if ctype in ("text/plain", "text/html"):
+                payload = part.get_payload(decode=True)
+                if payload:
                     try:
-                        conn.logout()
+                        text = payload.decode(part.get_content_charset() or 'utf-8', errors='ignore')
                     except Exception:
-                        pass
-                    message_progress.progress(100)
-                else:
-                    # parallel: split batch among worker subchunks and launch parallel workers
-                    subchunk_size = max(1, int(len(batch) // int(workers)))
-                    subchunks = list(chunkify_list(batch, subchunk_size))
-                    with ThreadPoolExecutor(max_workers=int(workers)) as ex:
-                        futures = []
-                        for sc in subchunks:
-                            futures.append(ex.submit(worker_fetch_subchunk := None))  # placeholder to avoid lint; will replace below
-                        # build proper futures list by submitting the function correctly
-                        futures = [ex.submit(lambda sc=sc: (
-                            lambda: None  # placeholder
-                        )()) for sc in subchunks]  # replaced below
+                        text = str(payload)
+                    maybe = find_subid_in_text(text)
+                    if maybe:
+                        return maybe, map_id_to_type(maybe)
+                    tokens = re.split(r'[^A-Za-z0-9_\-+/=]', text)
+                    for token in tokens:
+                        if len(token) < 12:
+                            continue
+                        decoded = try_base64_variants(token)
+                        if decoded:
+                            maybe2 = find_subid_in_text(decoded)
+                            if maybe2:
+                                return maybe2, map_id_to_type(maybe2)
+    except Exception:
+        pass
+    return None, "-"
 
-                    # Because inline lambda with closures is messy, use a simple loop approach:
-                    with ThreadPoolExecutor(max_workers=int(workers)) as ex:
-                        futures = [ex.submit(lambda sc=sc: __import__('__main__').worker_fetch_chunk(sc, mail_folders, imap_host, 993, email_user, app_password, int(max_retries), int(base_retry_delay))) for sc in subchunks]  # noqa: E501
-                        completed = 0
-                        for fut in as_completed(futures):
-                            try:
-                                resobj = fut.result()
-                            except Exception as e:
-                                resobj = {'error': str(e), 'data': []}
-                            if resobj.get('error'):
-                                st.warning(f"Worker error in batch {bi}: {resobj['error']}")
-                            else:
-                                # resobj['data'] expected list of items similar to sequential's items
-                                for item in resobj.get('data', []):
-                                    # ensure uid string
-                                    uid_str = item.get('uid', (item['uid'].decode() if isinstance(item['uid'], bytes) else str(item['uid'])))
-                                    save_item = {'uid': uid_str, 'folder': item.get('folder', ''), 'html': item.get('html', ''), 'css': item.get('css', '')}
-                                    append_checkpoint_item(run_dir, save_item)
-                                    append_fetched_uid(run_dir, uid_str)
-                                    all_extracted.append(save_item)
-                            completed += 1
-                            message_progress.progress(int(completed/len(subchunks)*100))
-                            message_line.write(f"Completed {completed}/{len(subchunks)} parallel workers for this batch")
-                    message_progress.progress(100)
+# ---------- Fetch Function with Sub-ID integrated ----------
+def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None):
+    results = []
+    new_last_uid = last_uid
+    try:
+        email_addr = email_addr.strip()
+        password = password.strip()
+        imap = imaplib.IMAP4_SSL("imap.gmail.com")
+        imap.login(email_addr, password)
+        imap.select("inbox")
+        uids = []
+        if last_uid:
+            try:
+                criteria = f'(UID {int(last_uid)+1}:*)'
+                status, data = imap.uid('search', None, criteria)
+                if status == 'OK' and data and data[0]:
+                    uids = data[0].split()
+            except Exception:
+                pass
+        elif fetch_n:
+            status, data = imap.uid('search', None, 'ALL')
+            if status == 'OK' and data and data[0]:
+                all_uids = data[0].split()
+                if len(all_uids) > 0:
+                    uids = all_uids[-int(fetch_n):]
+        else:
+            ist = pytz.timezone('Asia/Kolkata')
+            today_ist = datetime.datetime.now(ist).strftime("%d-%b-%Y")
+            status, data = imap.uid('search', None, f'(SINCE "{today_ist}")')
+            if status == 'OK' and data and data[0]:
+                uids = data[0].split()
 
-                # end of batch: update batch progress and free UI
-                message_line.empty()
-                message_progress.empty()
-                batch_progress.progress(int(bi / n_batches * 100))
+        for uid in uids:
+            if not uid: continue
+            uid_dec = uid.decode()
+            res, msg_data = imap.uid('fetch', uid_dec, '(BODY.PEEK[HEADER])')
+            if res == 'OK' and isinstance(msg_data[0], tuple):
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = decode_mime_words(msg.get("Subject", "No Subject"))
+                from_header = decode_mime_words(msg.get("From", "-"))
+                domain = extract_domain_from_address(from_header)
+                spf, dkim, dmarc = extract_auth_results_from_headers(msg)
+                sub_id, id_type = extract_subid_from_msg(msg)
+                results.append({
+                    "UID": uid_dec,
+                    "Domain": domain,
+                    "Subject": subject,
+                    "From": from_header,
+                    "Message-ID": decode_mime_words(msg.get("Message-ID", "")),
+                    "Sub ID": sub_id or "-",
+                    "Type": id_type,
+                    "SPF": spf,
+                    "DKIM": dkim,
+                    "DMARC": dmarc
+                })
+                if new_last_uid is None or (uid_dec.isdigit() and int(uid_dec) > int(new_last_uid)):
+                    new_last_uid = uid_dec
+        imap.logout()
+    except imaplib.IMAP4.error as e:
+        st.error(f"IMAP error for {email_addr}: {e}")
+        return pd.DataFrame(), last_uid
+    except Exception as e:
+        st.error(f"Error fetching {email_addr}: {e}")
+        return pd.DataFrame(), last_uid
+    return pd.DataFrame(results), new_last_uid
 
-            # end batches loop
+def highlight_new_rows(row):
+    return ['background-color: #90EE90'] * len(row) if row.get("is_new", False) else [''] * len(row)
 
-            st.write(f"Fetched & checkpointed items: {len(all_extracted)}")
+# ---------- Account Input UI ----------
+st.markdown("### 📋 Account Credentials")
+st.info("Add as many accounts as you need. Passwords are required (App Passwords recommended for Gmail).")
 
-            # flatten checkpointed items into file records for clustering
-            file_records = []
-            for item in all_extracted:
-                uid = item['uid']
-                folder = item.get('folder', 'unknown')
-                fid = f"{folder}_{uid}_{uuid.uuid4().hex[:6]}"
-                html_path = tmpdir / f"{fid}.html"
-                css_path = tmpdir / f"{fid}.css"
-                html_path.write_text(item.get('html',''), encoding='utf-8')
-                css_path.write_text(item.get('css',''), encoding='utf-8')
-                file_records.append({'uid': uid, 'folder': folder, 'html_path': str(html_path), 'css_path': str(css_path), 'html_text': item.get('html','')})
+column_config = {
+    "Email": st.column_config.TextColumn("Email Address", width="medium", required=True),
+    "Password": st.column_config.TextColumn("App Password", width="medium", required=True),
+}
 
-            st.write(f"Saved {len(file_records)} html parts to disk for clustering.")
+edited_df = st.data_editor(
+    st.session_state.creds_df,
+    num_rows="dynamic",
+    column_config=column_config,
+    key="editor_changes",
+    use_container_width=True,
+    hide_index=True
+)
+st.session_state.creds_df = edited_df
 
-            # clustering & zip
-            docs = [clean_for_vector(r['html_text']) for r in file_records]
-            if len(docs) == 0:
-                st.error("No HTML documents to cluster.")
-            else:
-                vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,3), stop_words='english')
-                X = vectorizer.fit_transform(docs)
-                if cluster_mode == "Fixed clusters (n)":
-                    ncl = min(int(n_clusters), len(docs))
-                    model = AgglomerativeClustering(n_clusters=ncl, affinity='euclidean', linkage='ward')
-                else:
-                    model = AgglomerativeClustering(n_clusters=None, distance_threshold=float(distance_threshold), affinity='euclidean', linkage='ward')
+# ---------- Sub-ID threshold input ----------
+# Count how many non-empty email rows we have available
+non_empty_creds = [r for i, r in st.session_state.creds_df.iterrows() if r.get("Email", "").strip()]
+available_accounts = max(1, len(non_empty_creds))
+required_accounts_count = st.number_input(
+    "Require Sub-ID presence in at least N accounts (set N):",
+    min_value=1,
+    max_value=available_accounts,
+    value=min(2, available_accounts),
+    step=1,
+    help="Only show Sub-IDs for message assets that appear in at least this many accounts."
+)
 
-                labels = model.fit_predict(X.toarray())
-                clusters = {}
-                for rec, lab in zip(file_records, labels):
-                    clusters.setdefault(int(lab), []).append(rec)
+if required_accounts_count > available_accounts:
+    st.warning(f"You set N = {required_accounts_count}, but only {available_accounts} account(s) have non-empty Email. Please adjust N or add accounts.")
 
-                out_zip = tmpdir / f"email_templates_clusters_{uuid.uuid4().hex[:8]}.zip"
-                with zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for lab, items in clusters.items():
-                        folder_name = f"cluster_{lab}"
-                        for it in items:
-                            arc_html = str(Path(folder_name) / Path(it['html_path']).name)
-                            zf.write(it['html_path'], arc_html)
-                            if os.path.exists(it['css_path']) and Path(it['css_path']).stat().st_size > 0:
-                                arc_css = str(Path(folder_name) / Path(it['css_path']).name)
-                                zf.write(it['css_path'], arc_css)
+# ---------- Fetch Controls ----------
+st.markdown("---")
+colA, colB, colC = st.columns([1, 1, 1])
 
-                st.success(f"Created ZIP: {out_zip.name}")
-                with open(out_zip, 'rb') as fh:
-                    st.download_button("Download clustered ZIP", fh.read(), file_name=out_zip.name)
+def process_fetch(fetch_type, fetch_n=None):
+    any_run = False
+    for index, row in st.session_state.creds_df.iterrows():
+        email_addr = row.get("Email", "").strip()
+        pwd = row.get("Password", "").strip()
+        if not email_addr or not pwd:
+            continue
+        if email_addr not in st.session_state.mailbox_data:
+            st.session_state.mailbox_data[email_addr] = get_empty_mailbox_structure()
+        current_data = st.session_state.mailbox_data[email_addr]
+        if "is_new" in current_data["df"].columns:
+            current_data["df"]["is_new"] = False
+        any_run = True
+        df_new, new_uid = (
+            fetch_inbox_emails_single(email_addr, pwd, last_uid=current_data.get("last_uid"))
+            if fetch_type == 'incremental'
+            else fetch_inbox_emails_single(email_addr, pwd, fetch_n=int(fetch_n))
+        )
+        if not df_new.empty:
+            df_new["is_new"] = True
+            current_data["df"] = pd.concat([current_data["df"], df_new], ignore_index=True).drop_duplicates(subset=["UID"], keep='last')
+            try:
+                current_data["last_uid"] = str(current_data["df"]["UID"].astype(int).max())
+            except:
+                pass
+    return any_run
 
-        # cleanup tmpdir (keep checkpoints)
-        try:
-            shutil.rmtree(tmpdir)
-        except Exception:
-            pass
+with colA:
+    if st.button("🔄 Fetch New Emails (incremental)"):
+        if process_fetch('incremental'): st.success("Fetched incremental emails.")
+        else: st.warning("No valid credentials found in table.")
+
+with colB:
+    fetch_n = st.number_input("Fetch last N emails", min_value=1, value=10, step=1)
+    if st.button("📥 Fetch Last N Emails"):
+        if process_fetch('last_n', fetch_n): st.success(f"Fetched last {fetch_n} emails.")
+        else: st.warning("No valid credentials found in table.")
+
+with colC:
+    if st.button("🗑️ Clear All Stored Data"):
+        st.session_state.mailbox_data = {}
+        st.success("Cleared all fetched emails (credentials preserved).")
+        st.rerun()
+
+# ---------- Email Counts ----------
+st.markdown("### 📊 Email Counts per Account")
+if not st.session_state.mailbox_data:
+    st.write("No data fetched yet.")
+else:
+    active_emails = [k for k in st.session_state.mailbox_data.keys()]
+    if active_emails:
+        m_cols = st.columns(len(active_emails))
+        for i, email_key in enumerate(active_emails):
+            data = st.session_state.mailbox_data[email_key]
+            total_count = len(data["df"])
+            new_count = data["df"]["is_new"].sum() if "is_new" in data["df"].columns else 0
+            short_name = email_key.split('@')[0]
+            with m_cols[i]:
+                st.metric(label=short_name, value=total_count, delta=f"{new_count} New" if new_count > 0 else None)
 
 st.markdown("---")
-st.caption("Checkpoints are stored in ./email_extractor_checkpoints/<run_dir>/. Resume is available from the latest run.")
+
+# ---------- Email Presence Table (unchanged logic) ----------
+all_keys = set()
+email_presence_map = {}  # { email_address: set(message_keys) }
+new_email_keys = set()
+valid_emails = [r["Email"] for i, r in st.session_state.creds_df.iterrows() if r["Email"] in st.session_state.mailbox_data]
+
+for email_addr in valid_emails:
+    df_acc = st.session_state.mailbox_data[email_addr]["df"]
+    keys = set()
+    for _, row in df_acc.iterrows():
+        msg_key = (row["Domain"], row["Subject"], row["From"], row["SPF"], row["DKIM"], row["DMARC"], row.get("Sub ID", "-"))
+        keys.add(msg_key)
+        if row.get("is_new", False):
+            new_email_keys.add(msg_key)
+    email_presence_map[email_addr] = keys
+    all_keys.update(keys)
+
+rows = []
+if all_keys:
+    sorted_keys = sorted(list(all_keys), key=lambda k: (k not in new_email_keys, k[0], k[1]))
+    for (domain, subject, from_val, spf, dkim, dmarc, subid) in sorted_keys:
+        row_data = {
+            "Domain": domain, "From": from_val, "Subject": subject,
+            "Sub ID": subid,
+            "Auth": "Pass" if all(res == 'pass' for res in [spf, dkim, dmarc]) else "Fail",
+            "is_new": (domain, subject, from_val, spf, dkim, dmarc, subid) in new_email_keys
+        }
+        for email_addr in valid_emails:
+            is_present = (domain, subject, from_val, spf, dkim, dmarc, subid) in email_presence_map[email_addr]
+            col_header = email_addr.split('@')[0]
+            row_data[col_header] = "✅" if is_present else "❌"
+        rows.append(row_data)
+
+    st.subheader("📋 Email Presence Table (Newest on Top)")
+    if rows:
+        presence_df = pd.DataFrame(rows)
+        st.dataframe(presence_df.style.apply(highlight_new_rows, axis=1), hide_index=True, column_config={"is_new": None})
+else:
+    st.info("No emails found in the active accounts.")
+
+st.markdown("---")
+
+# ---------- NEW: Sub-ID Matches (only assets present in >= required_accounts_count accounts) ----------
+st.subheader(f"🔎 Sub-ID Matches (only assets present in ≥ {required_accounts_count} accounts)")
+
+# Build a mapping from asset-key (Domain, From, Subject) -> details across accounts
+asset_map = {}  # {(domain, from, subject): {"accounts": set(), "subids": set(), "rows": [row dicts]}}
+for email_addr in valid_emails:
+    df_acc = st.session_state.mailbox_data[email_addr]["df"]
+    for _, r in df_acc.iterrows():
+        asset_key = (r.get("Domain", "-"), r.get("From", "-"), r.get("Subject", "-"))
+        asset = asset_map.setdefault(asset_key, {"accounts": set(), "subids": set(), "rows": []})
+        asset["accounts"].add(email_addr)
+        sid = r.get("Sub ID", "-")
+        if sid and sid != "-":
+            asset["subids"].add(sid)
+        asset["rows"].append({
+            "account": email_addr,
+            "UID": r.get("UID"),
+            "Message-ID": r.get("Message-ID"),
+            "Sub ID": sid or "-",
+            "Type": r.get("Type", "-"),
+            "SPF": r.get("SPF"),
+            "DKIM": r.get("DKIM"),
+            "DMARC": r.get("DMARC")
+        })
+
+# Now filter assets that meet the threshold
+subid_rows = []
+for (domain, from_val, subject), info in asset_map.items():
+    present_count = len(info["accounts"])
+    if present_count >= required_accounts_count:
+        # Build a row that lists all subids (comma-separated) and which accounts have the message
+        subid_list = sorted(list(info["subids"])) if info["subids"] else []
+        accounts_list = sorted(list(info["accounts"]))
+        row = {
+            "Domain": domain,
+            "From": from_val,
+            "Subject": subject,
+            "Present In (Count)": present_count,
+            "Accounts": ", ".join([a.split('@')[0] for a in accounts_list]),
+            "Sub IDs (all)": ", ".join(subid_list) if subid_list else "-"
+        }
+        # Also include per-account tick columns for quick glance
+        for email_addr in valid_emails:
+            header = email_addr.split('@')[0]
+            row[header] = "✅" if email_addr in info["accounts"] else "❌"
+        subid_rows.append(row)
+
+if subid_rows:
+    subid_df = pd.DataFrame(subid_rows)
+    # Sort by present count desc then domain
+    subid_df = subid_df.sort_values(by=["Present In (Count)", "Domain"], ascending=[False, True], ignore_index=True)
+    st.dataframe(subid_df, use_container_width=True)
+else:
+    st.info(f"No assets found that appear in at least {required_accounts_count} accounts. Adjust N or fetch more emails.")
+
+# ---------- Individual Raw Data (unchanged) ----------
+with st.expander("Show Individual Raw Messages"):
+    for email_addr in valid_emails:
+        data = st.session_state.mailbox_data[email_addr]
+        st.markdown(f"**{email_addr}** — Stored: {len(data['df'])}")
+        if not data["df"].empty:
+            df_to_show = data["df"].copy()
+            df_to_show['UID_int'] = pd.to_numeric(df_to_show['UID'], errors='coerce')
+            sorted_df_to_show = df_to_show.sort_values(by=["is_new", "UID_int"], ascending=[False, False])
+            st.dataframe(sorted_df_to_show.drop(columns=['UID_int']).style.apply(highlight_new_rows, axis=1), hide_index=True, column_config={"is_new": None})
