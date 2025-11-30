@@ -288,52 +288,7 @@ edited_df = st.data_editor(
 )
 st.session_state.creds_df = edited_df
 
-# ---------- Threshold + Fetch controls in one line ----------
-st.markdown("---")
-col_f1, col_f2, col_f3, col_f4 = st.columns([1.2, 1.2, 2.5, 1.2])
-
-with col_f1:
-    if st.button("🔄 Fetch New (incremental)"):
-        if process_fetch := globals().get('process_fetch'):
-            if process_fetch('incremental'):
-                st.success("Fetched incremental emails.")
-            else:
-                st.warning("No valid credentials found in table.")
-        else:
-            st.warning("Fetch function not available.")
-
-with col_f2:
-    fetch_n = st.number_input("N", min_value=1, value=10, step=1, label_visibility="collapsed", key="compact_fetch_n")
-    fetch_unit = st.selectbox("Unit", ["emails", "hours", "minutes"], index=0, label_visibility="collapsed", key="compact_unit")
-    if st.button("📥 Fetch Last N"):
-        if process_fetch := globals().get('process_fetch'):
-            if process_fetch('last_n', fetch_n=fetch_n, fetch_unit=fetch_unit):
-                st.success(f"Fetched last {fetch_n} {fetch_unit}.")
-            else:
-                st.warning("No valid credentials found in table.")
-        else:
-            st.warning("Fetch function not available.")
-
-with col_f3:
-    non_empty_creds = [r for i, r in st.session_state.creds_df.iterrows() if r.get("Email", "").strip()]
-    available_accounts = max(1, len(non_empty_creds))
-    required_accounts_count = st.number_input(
-        "Require Sub-ID presence in at least N accounts",
-        min_value=1,
-        max_value=available_accounts,
-        value=min(2, available_accounts),
-        step=1,
-        help="Show Sub-IDs that appear in ≥ N accounts and have Sub-IDs in ≥ N accounts.",
-        key="compact_required_n"
-    )
-
-with col_f4:
-    if st.button("🗑️ Clear All"):
-        st.session_state.mailbox_data = {}
-        st.success("Cleared all fetched emails (credentials preserved).")
-        st.rerun()
-
-# Expose process_fetch here (used by the compact row above)
+# ---------- Exposed process_fetch (defined BEFORE controls so UI can call it) ----------
 def process_fetch(fetch_type, fetch_n=None, fetch_unit='emails'):
     any_run = False
     for index, row in st.session_state.creds_df.iterrows():
@@ -347,7 +302,10 @@ def process_fetch(fetch_type, fetch_n=None, fetch_unit='emails'):
         if "is_new" in current_data["df"].columns:
             current_data["df"]["is_new"] = False
         any_run = True
-        df_new, new_uid = fetch_inbox_emails_single(email_addr, pwd, last_uid=current_data.get("last_uid")) if fetch_type == 'incremental' else fetch_inbox_emails_single(email_addr, pwd, fetch_n=int(fetch_n), fetch_unit=fetch_unit)
+        if fetch_type == 'incremental':
+            df_new, new_uid = fetch_inbox_emails_single(email_addr, pwd, last_uid=current_data.get("last_uid"))
+        else:
+            df_new, new_uid = fetch_inbox_emails_single(email_addr, pwd, fetch_n=int(fetch_n), fetch_unit=fetch_unit)
         if not df_new.empty:
             df_new["is_new"] = True
             current_data["df"] = pd.concat([current_data["df"], df_new], ignore_index=True).drop_duplicates(subset=["UID"], keep='last')
@@ -356,6 +314,47 @@ def process_fetch(fetch_type, fetch_n=None, fetch_unit='emails'):
             except:
                 pass
     return any_run
+
+# ---------- Threshold + Fetch controls in one line (UI) ----------
+st.markdown("---")
+col_f1, col_f2, col_f3, col_f4 = st.columns([1.2, 1.2, 2.5, 1.2])
+
+with col_f1:
+    if st.button("🔄 Fetch New (incremental)"):
+        if process_fetch('incremental'):
+            st.success("Fetched incremental emails.")
+        else:
+            st.warning("No valid credentials found in table.")
+
+with col_f2:
+    fetch_n = st.number_input("N", min_value=1, value=10, step=1, label_visibility="collapsed", key="compact_fetch_n")
+    fetch_unit = st.selectbox("Unit", ["emails", "hours", "minutes"], index=0, label_visibility="collapsed", key="compact_unit")
+    if st.button("📥 Fetch Last N"):
+        if process_fetch('last_n', fetch_n=fetch_n, fetch_unit=fetch_unit):
+            st.success(f"Fetched last {fetch_n} {fetch_unit}.")
+        else:
+            st.warning("No valid credentials found in table.")
+
+with col_f3:
+    non_empty_creds = [r for i, r in st.session_state.creds_df.iterrows() if r.get("Email", "").strip()]
+    available_accounts = max(1, len(non_empty_creds))
+    # default set to 4 as requested; bounded to available_accounts
+    default_n = 4 if available_accounts >= 4 else available_accounts
+    required_accounts_count = st.number_input(
+        "Require Sub-ID presence in at least N accounts",
+        min_value=1,
+        max_value=available_accounts,
+        value=default_n,
+        step=1,
+        help="Show Sub-IDs that appear in ≥ N accounts and have Sub-IDs in ≥ N accounts.",
+        key="compact_required_n"
+    )
+
+with col_f4:
+    if st.button("🗑️ Clear All"):
+        st.session_state.mailbox_data = {}
+        st.success("Cleared all fetched emails (credentials preserved).")
+        st.rerun()
 
 st.markdown("---")
 
@@ -442,10 +441,8 @@ for (domain, from_val, subject), info in asset_map.items():
 
 if subid_rows:
     subid_df = pd.DataFrame(subid_rows)
-    # Ensure is_new exists and use it for highlighting but hide the column
     if "is_new" not in subid_df.columns:
         subid_df["is_new"] = False
-    # Order columns: Domain, From, Subject, Sub IDs (all), <per-account cols>, is_new
     per_account_cols = [e.split('@')[0] for e in valid_emails]
     display_cols = ["Domain", "From", "Subject", "Sub IDs (all)"] + per_account_cols + ["is_new"]
     subid_df = subid_df.reindex(columns=display_cols, fill_value="-")
