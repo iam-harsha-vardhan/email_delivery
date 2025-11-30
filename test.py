@@ -16,6 +16,10 @@ from typing import List
 st.set_page_config(page_title="Fast IMAP Sub-ID Fetcher", layout="wide")
 st.title("⚡ Fast IMAP: last N minutes (batched) + Sub-ID Consensus")
 
+# ---------- Configurable defaults (no UI knobs shown) ----------
+UID_SCAN_LIMIT = 2000  # how many recent UIDs to scan when using time windows
+CHUNK_SIZE = 200       # how many UIDs to fetch per IMAP UID FETCH call
+
 # ---------- Session state defaults ----------
 if "creds_df" not in st.session_state:
     st.session_state.creds_df = pd.DataFrame([{"Email": "", "Password": ""}])
@@ -159,7 +163,6 @@ def parse_fetch_parts_for_uid_and_date(fetch_response_parts) -> List[tuple]:
     for part in fetch_response_parts:
         if not isinstance(part, tuple):
             continue
-        # part[0] contains something like: b'123 (UID 456 BODY[HEADER.FIELDS (DATE)] {78}'
         header_bytes, body_bytes = part[0], part[1]
         try:
             meta = header_bytes.decode('utf-8', errors='ignore')
@@ -171,10 +174,8 @@ def parse_fetch_parts_for_uid_and_date(fetch_response_parts) -> List[tuple]:
         uid_match = re.search(r'UID\s+(\d+)', meta)
         uid_str = uid_match.group(1) if uid_match else None
         raw_date = ""
-        # body_bytes contains e.g. b'Date: Thu, 30 Nov 2025 10:12:00 +0000\r\n\r\n'
         if body_bytes:
             try:
-                # decode and extract Date header
                 body_text = body_bytes.decode('utf-8', errors='ignore')
             except Exception:
                 body_text = str(body_bytes)
@@ -186,7 +187,7 @@ def parse_fetch_parts_for_uid_and_date(fetch_response_parts) -> List[tuple]:
     return results
 
 # ---------- Core fetch function (optimized) ----------
-def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None, fetch_unit='emails', uid_scan_limit=2000, chunk_size=200):
+def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None, fetch_unit='emails', uid_scan_limit=UID_SCAN_LIMIT, chunk_size=CHUNK_SIZE):
     """
     Returns DataFrame of matched headers and new_last_uid.
     For fetch_unit in ('hours','minutes') uses batched UID FETCH to quickly find messages within cutoff.
@@ -253,7 +254,6 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
 
                         # parse parts -> list of (uid, raw_date)
                         parsed = parse_fetch_parts_for_uid_and_date(fdata)
-                        # parsed order should correspond to chunk order for most servers, but we rely on UID extracted
                         for uid_str, raw_date in parsed:
                             if not raw_date:
                                 continue
@@ -323,8 +323,7 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                     msg = email.message_from_bytes(hdr_bytes)
                 except Exception:
                     continue
-                # We MUST determine which UID this part corresponds to. The server may include UID in the meta of part[0].
-                # Try to extract UID from the part header (part[0])
+                # Try to extract UID from part[0] meta when available
                 uid_found = None
                 try:
                     meta = part[0].decode('utf-8', errors='ignore')
@@ -333,7 +332,6 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                         uid_found = m.group(1)
                 except Exception:
                     uid_found = None
-                # fallback: try to get Message-ID header and treat UID as unknown (we'll set UID to None)
                 subject = decode_mime_words(msg.get("Subject", "No Subject"))
                 from_h = decode_mime_words(msg.get("From", "-"))
                 domain = extract_domain_from_address(from_h)
@@ -341,10 +339,9 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                 sub_id, id_type = extract_subid_from_msg(msg)
                 raw_date = msg.get("Date", "")
                 formatted, dt = format_date_to_ist_string(raw_date)
-                uid_str = uid_found if uid_found else (None)
-                # If uid_found is none, skip appending because we cannot dedupe; but in practice most servers include UID
+                uid_str = uid_found if uid_found else None
                 if uid_str is None:
-                    # try to extract UID by matching Message-ID against our chunk via a second per-UID pass (rare)
+                    # in rare servers where UID not included, skip (most servers include UID)
                     continue
                 results.append({
                     "UID": uid_str,
@@ -384,17 +381,6 @@ column_config = {
 edited_df = st.data_editor(st.session_state.creds_df, num_rows="dynamic", column_config=column_config, key="editor", use_container_width=True, hide_index=True)
 st.session_state.creds_df = edited_df
 
-# ---------- UI: performance knobs ----------
-st.markdown("---")
-st.markdown("### ⚙️ Performance Tuning (for time-window fetches)")
-col_a, col_b, col_c = st.columns([1,1,2])
-with col_a:
-    uid_scan_limit = st.number_input("UID_SCAN_LIMIT (max UIDs to scan)", min_value=100, max_value=20000, value=2000, step=100, help="Larger => more coverage but slower.")
-with col_b:
-    chunk_size = st.number_input("CHUNK_SIZE (UIDs per FETCH)", min_value=20, max_value=1000, value=200, step=10, help="Large chunk reduces round trips; some servers may reject huge chunks.")
-with col_c:
-    st.caption("Tip: If you routinely fetch every few minutes, set UID_SCAN_LIMIT modest (500-2000) and chunk_size 200-400.")
-
 # ---------- Exposed process_fetch ----------
 def process_fetch(fetch_type, fetch_n=None, fetch_unit='emails'):
     any_run = False
@@ -413,7 +399,7 @@ def process_fetch(fetch_type, fetch_n=None, fetch_unit='emails'):
         df_new, new_uid = fetch_inbox_emails_single(
             email_addr, pwd, last_uid=mailbox.get("last_uid"),
             fetch_n=fetch_n, fetch_unit=fetch_unit,
-            uid_scan_limit=int(uid_scan_limit), chunk_size=int(chunk_size)
+            uid_scan_limit=UID_SCAN_LIMIT, chunk_size=CHUNK_SIZE
         )
         if not df_new.empty:
             df_new["is_new"] = True
