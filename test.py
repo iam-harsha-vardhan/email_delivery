@@ -21,9 +21,6 @@ if "creds_df" not in st.session_state:
 if "mailbox_data" not in st.session_state:
     st.session_state.mailbox_data = {}
 
-if "subid_tag" not in st.session_state:
-    st.session_state.subid_tag = ""
-
 # ---------- Helper: empty mailbox structure ----------
 def get_empty_mailbox_structure():
     return {
@@ -83,7 +80,6 @@ def map_id_to_type(sub_id):
     return "-"
 
 def try_base64_variants(s):
-    """Try standard and urlsafe base64 decode with small paddings."""
     if not s or len(s) < 4:
         return None
     s = s.strip()
@@ -113,7 +109,6 @@ def find_subid_in_text(text):
     return None
 
 def extract_subid_from_msg(msg):
-    """Search Message-ID tokens, headers, and text parts for a Sub-ID. Returns (sub_id or None, type)."""
     # 1) Message-ID header tokens
     msg_id_raw = decode_mime_words(msg.get("Message-ID", "") or msg.get("Message-Id", "") or "")
     if msg_id_raw:
@@ -161,10 +156,6 @@ def extract_subid_from_msg(msg):
 
 # ---------- Fetch function (supports last N emails / hours / minutes) ----------
 def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None, fetch_unit='emails'):
-    """
-    fetch_unit: 'emails' (last N messages), 'hours' or 'minutes' (messages since now - N units)
-    For hours/minutes, we fetch a bounded set of recent UIDs and then filter by Date header.
-    """
     results = []
     new_last_uid = last_uid
     try:
@@ -176,7 +167,6 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
 
         uids = []
 
-        # If incremental (last_uid provided), use UID since logic (ignoring fetch_n here)
         if last_uid and fetch_unit == 'emails' and fetch_n is None:
             try:
                 criteria = f'(UID {int(last_uid)+1}:*)'
@@ -187,7 +177,6 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                 pass
 
         elif fetch_unit == 'emails' and fetch_n:
-            # Fetch last N emails (as before)
             status, data = imap.uid('search', None, 'ALL')
             if status == 'OK' and data and data[0]:
                 all_uids = data[0].split()
@@ -195,22 +184,17 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                     uids = all_uids[-int(fetch_n):]
 
         elif fetch_unit in ('hours', 'minutes') and fetch_n:
-            # Compute cutoff in IST
             ist = pytz.timezone('Asia/Kolkata')
             now_ist = datetime.datetime.now(ist)
             if fetch_unit == 'hours':
                 cutoff = now_ist - datetime.timedelta(hours=int(fetch_n))
             else:
                 cutoff = now_ist - datetime.timedelta(minutes=int(fetch_n))
-            # We'll fetch a bounded number of recent UIDs to avoid scanning entire mailbox.
-            # Tune this LIMIT to your needs (lower -> faster, higher -> more coverage)
             UID_SCAN_LIMIT = 2000
             status, data = imap.uid('search', None, 'ALL')
             if status == 'OK' and data and data[0]:
                 all_uids = data[0].split()
-                # consider at most last UID_SCAN_LIMIT UIDs
                 uids_to_check = all_uids[-UID_SCAN_LIMIT:] if len(all_uids) > UID_SCAN_LIMIT else all_uids
-                # Now we'll iterate and include only those whose Date >= cutoff
                 for uid in uids_to_check:
                     uid_dec = uid.decode()
                     res, msg_data = imap.uid('fetch', uid_dec, '(BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM MESSAGE-ID)])')
@@ -223,13 +207,11 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                             continue
                         try:
                             msg_dt = parsedate_to_datetime(raw_date)
-                            # convert to IST for comparison
                             ist_offset = pytz.timezone('Asia/Kolkata')
                             if msg_dt.tzinfo is None:
                                 msg_dt = msg_dt.replace(tzinfo=datetime.timezone.utc)
                             msg_dt_ist = msg_dt.astimezone(ist_offset).replace(tzinfo=None)
                         except Exception:
-                            # if parsing fails, skip
                             continue
                         if msg_dt_ist >= cutoff.replace(tzinfo=None):
                             uids.append(uid)
@@ -237,22 +219,18 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                         continue
 
         else:
-            # Default: today's emails (same as original)
             ist = pytz.timezone('Asia/Kolkata')
             today_ist = datetime.datetime.now(ist).strftime("%d-%b-%Y")
             status, data = imap.uid('search', None, f'(SINCE "{today_ist}")')
             if status == 'OK' and data and data[0]:
                 uids = data[0].split()
 
-        # If uids not set above (e.g., incremental without last_uid), ensure it's an iterable
         if not uids:
             uids = []
 
-        # Fetch headers for selected UIDs (if we already fetched for hours/minutes we only added UIDs that match)
         for uid in uids:
             if not uid: continue
             uid_dec = uid.decode()
-            # If we previously fetched a small header snippet for time filtering, we may re-fetch full header here
             res, msg_data = imap.uid('fetch', uid_dec, '(BODY.PEEK[HEADER])')
             if res == 'OK' and msg_data and isinstance(msg_data[0], tuple):
                 msg = email.message_from_bytes(msg_data[0][1])
@@ -310,40 +288,52 @@ edited_df = st.data_editor(
 )
 st.session_state.creds_df = edited_df
 
-# ---------- Tag input + threshold (positioned beside fetch controls) ----------
+# ---------- Threshold + Fetch controls in one line ----------
 st.markdown("---")
-col_left, col_mid, col_right, col_tag = st.columns([1,1,1,1])
+col_f1, col_f2, col_f3, col_f4 = st.columns([1.2, 1.2, 2.5, 1.2])
 
-with col_tag:
-    tag_input = st.text_input("Tag (one word)", value=st.session_state.subid_tag, help="Single word tag (keeps only first token).")
-    token = tag_input.strip().split()[0] if tag_input.strip() else ""
-    st.session_state.subid_tag = token
+with col_f1:
+    if st.button("🔄 Fetch New (incremental)"):
+        if process_fetch := globals().get('process_fetch'):
+            if process_fetch('incremental'):
+                st.success("Fetched incremental emails.")
+            else:
+                st.warning("No valid credentials found in table.")
+        else:
+            st.warning("Fetch function not available.")
 
-# Count how many non-empty email rows we have available
-non_empty_creds = [r for i, r in st.session_state.creds_df.iterrows() if r.get("Email", "").strip()]
-available_accounts = max(1, len(non_empty_creds))
+with col_f2:
+    fetch_n = st.number_input("N", min_value=1, value=10, step=1, label_visibility="collapsed", key="compact_fetch_n")
+    fetch_unit = st.selectbox("Unit", ["emails", "hours", "minutes"], index=0, label_visibility="collapsed", key="compact_unit")
+    if st.button("📥 Fetch Last N"):
+        if process_fetch := globals().get('process_fetch'):
+            if process_fetch('last_n', fetch_n=fetch_n, fetch_unit=fetch_unit):
+                st.success(f"Fetched last {fetch_n} {fetch_unit}.")
+            else:
+                st.warning("No valid credentials found in table.")
+        else:
+            st.warning("Fetch function not available.")
 
-required_accounts_count = st.number_input(
-    "Require Sub-ID presence in at least N accounts (set N):",
-    min_value=1,
-    max_value=available_accounts,
-    value=min(2, available_accounts),
-    step=1,
-    help="Only show Sub-IDs for assets that appear in at least this many accounts AND have Sub-IDs in ≥ N accounts."
-)
+with col_f3:
+    non_empty_creds = [r for i, r in st.session_state.creds_df.iterrows() if r.get("Email", "").strip()]
+    available_accounts = max(1, len(non_empty_creds))
+    required_accounts_count = st.number_input(
+        "Require Sub-ID presence in at least N accounts",
+        min_value=1,
+        max_value=available_accounts,
+        value=min(2, available_accounts),
+        step=1,
+        help="Show Sub-IDs that appear in ≥ N accounts and have Sub-IDs in ≥ N accounts.",
+        key="compact_required_n"
+    )
 
-if required_accounts_count > available_accounts:
-    st.warning(f"You set N = {required_accounts_count}, but only {available_accounts} account(s) have non-empty Email. Adjust N or add accounts.")
+with col_f4:
+    if st.button("🗑️ Clear All"):
+        st.session_state.mailbox_data = {}
+        st.success("Cleared all fetched emails (credentials preserved).")
+        st.rerun()
 
-# ---------- Fetch Controls (with Unit selector) ----------
-st.markdown("---")
-colA, colB, colC = st.columns([1, 1, 1])
-
-# Put fetch_n and unit selection above the button area for clarity
-with colB:
-    fetch_n = st.number_input("Fetch last N", min_value=1, value=10, step=1, key="fetch_n_input")
-    fetch_unit = st.selectbox("Units", options=["emails", "hours", "minutes"], index=0, help="Choose 'emails' (last N messages) or time window (last N hours/minutes).")
-
+# Expose process_fetch here (used by the compact row above)
 def process_fetch(fetch_type, fetch_n=None, fetch_unit='emails'):
     any_run = False
     for index, row in st.session_state.creds_df.iterrows():
@@ -357,11 +347,7 @@ def process_fetch(fetch_type, fetch_n=None, fetch_unit='emails'):
         if "is_new" in current_data["df"].columns:
             current_data["df"]["is_new"] = False
         any_run = True
-        df_new, new_uid = (
-            fetch_inbox_emails_single(email_addr, pwd, last_uid=current_data.get("last_uid"))
-            if fetch_type == 'incremental'
-            else fetch_inbox_emails_single(email_addr, pwd, fetch_n=int(fetch_n), fetch_unit=fetch_unit)
-        )
+        df_new, new_uid = fetch_inbox_emails_single(email_addr, pwd, last_uid=current_data.get("last_uid")) if fetch_type == 'incremental' else fetch_inbox_emails_single(email_addr, pwd, fetch_n=int(fetch_n), fetch_unit=fetch_unit)
         if not df_new.empty:
             df_new["is_new"] = True
             current_data["df"] = pd.concat([current_data["df"], df_new], ignore_index=True).drop_duplicates(subset=["UID"], keep='last')
@@ -371,26 +357,7 @@ def process_fetch(fetch_type, fetch_n=None, fetch_unit='emails'):
                 pass
     return any_run
 
-with colA:
-    if st.button("🔄 Fetch New Emails (incremental)"):
-        if process_fetch('incremental'):
-            st.success("Fetched incremental emails.")
-        else:
-            st.warning("No valid credentials found in table.")
-
-with colB:
-    if st.button("📥 Fetch Last N (by unit)"):
-        # uses fetch_n and fetch_unit from inputs
-        if process_fetch('last_n', fetch_n=fetch_n, fetch_unit=fetch_unit):
-            st.success(f"Fetched messages for last {fetch_n} {fetch_unit}.")
-        else:
-            st.warning("No valid credentials found in table.")
-
-with colC:
-    if st.button("🗑️ Clear All Stored Data"):
-        st.session_state.mailbox_data = {}
-        st.success("Cleared all fetched emails (credentials preserved).")
-        st.rerun()
+st.markdown("---")
 
 # ---------- Email Counts ----------
 st.markdown("### 📊 Email Counts per Account")
@@ -423,12 +390,10 @@ for email_addr in valid_emails:
     df_acc = st.session_state.mailbox_data[email_addr]["df"]
     keys = set()
     for _, row in df_acc.iterrows():
-        # presence key (unchanged)
         msg_key = (row["Domain"], row["Subject"], row["From"], row["SPF"], row["DKIM"], row["DMARC"], row.get("Sub ID", "-"))
         keys.add(msg_key)
         if row.get("is_new", False):
             new_email_keys.add(msg_key)
-        # build asset_map
         asset_key = (row.get("Domain", "-"), row.get("From", "-"), row.get("Subject", "-"))
         asset = asset_map.setdefault(asset_key, {"accounts": set(), "subids": set(), "subid_accounts": set(), "rows": []})
         asset["accounts"].add(email_addr)
@@ -450,14 +415,14 @@ for email_addr in valid_emails:
     email_presence_map[email_addr] = keys
     all_keys.update(keys)
 
-# ---------- TOP: Sub-ID Consensus (full width) ----------
+# ---------- TOP: Sub-ID Consensus (full width) - simplified columns ----------
 st.subheader(f"🔎 Sub-ID Consensus (≥ {required_accounts_count} accounts)")
 
 subid_rows = []
 for (domain, from_val, subject), info in asset_map.items():
     present_count = len(info["accounts"])
     subid_accounts_count = len(info["subid_accounts"])
-    # Strict requirement: both presence and subid must reach the threshold
+    # Must satisfy both thresholds
     if present_count >= required_accounts_count and subid_accounts_count >= required_accounts_count:
         subid_list = sorted(list(info["subids"]))
         accounts_list = sorted(list(info["accounts"]))
@@ -466,12 +431,10 @@ for (domain, from_val, subject), info in asset_map.items():
             "Domain": domain,
             "From": from_val,
             "Subject": subject,
-            "Present In (Count)": present_count,
-            "Sub-ID Accounts (Count)": subid_accounts_count,
-            "Accounts": ", ".join([a.split('@')[0] for a in accounts_list]),
             "Sub IDs (all)": ", ".join(subid_list) if subid_list else "-",
             "is_new": asset_is_new
         }
+        # Add per-account tick columns (same style as presence table)
         for email_addr in valid_emails:
             header = email_addr.split('@')[0]
             row[header] = "✅" if email_addr in info["accounts"] else "❌"
@@ -479,8 +442,14 @@ for (domain, from_val, subject), info in asset_map.items():
 
 if subid_rows:
     subid_df = pd.DataFrame(subid_rows)
-    subid_df = subid_df.sort_values(by=["Sub-ID Accounts (Count)", "Present In (Count)", "Domain"], ascending=[False, False, True], ignore_index=True)
-    st.dataframe(subid_df.style.apply(highlight_new_rows, axis=1), use_container_width=True)
+    # Ensure is_new exists and use it for highlighting but hide the column
+    if "is_new" not in subid_df.columns:
+        subid_df["is_new"] = False
+    # Order columns: Domain, From, Subject, Sub IDs (all), <per-account cols>, is_new
+    per_account_cols = [e.split('@')[0] for e in valid_emails]
+    display_cols = ["Domain", "From", "Subject", "Sub IDs (all)"] + per_account_cols + ["is_new"]
+    subid_df = subid_df.reindex(columns=display_cols, fill_value="-")
+    st.dataframe(subid_df.style.apply(highlight_new_rows, axis=1), hide_index=True, column_config={"is_new": None}, use_container_width=True)
 else:
     st.info(f"No assets found that contain Sub-IDs in at least {required_accounts_count} accounts and are present in ≥ {required_accounts_count} accounts.")
 
@@ -513,7 +482,7 @@ else:
 
 st.markdown("---")
 
-# ---------- Individual Raw Data (unchanged) ----------
+# ---------- Individual Raw Data ----------
 with st.expander("Show Individual Raw Messages"):
     for email_addr in valid_emails:
         data = st.session_state.mailbox_data[email_addr]
@@ -522,4 +491,4 @@ with st.expander("Show Individual Raw Messages"):
             df_to_show = data["df"].copy()
             df_to_show['UID_int'] = pd.to_numeric(df_to_show['UID'], errors='coerce')
             sorted_df_to_show = df_to_show.sort_values(by=["is_new", "UID_int"], ascending=[False, False])
-            st.dataframe(sorted_df_to_show.drop(columns=['UID_int']).style.apply(highlight_new_rows, axis=1), hide_index=True, column_config={"is_new": None})
+            st.dataframe(sorted_df_to_show.drop(columns=['UID_int']).style.apply(highlight_new_rows, axis=1), hide_index=True, column_config={"is_new": None}, use_container_width=True)
