@@ -20,6 +20,10 @@ if "creds_df" not in st.session_state:
 if "mailbox_data" not in st.session_state:
     st.session_state.mailbox_data = {}
 
+# Keep a one-word tag in session state (user requested single-word input)
+if "subid_tag" not in st.session_state:
+    st.session_state.subid_tag = ""
+
 def get_empty_mailbox_structure():
     return {
         "last_uid": None,
@@ -238,10 +242,26 @@ edited_df = st.data_editor(
 )
 st.session_state.creds_df = edited_df
 
-# ---------- Sub-ID threshold input ----------
+# ---------- Sub-ID threshold input and one-word Tag placed beside fetch buttons ----------
+st.markdown("---")
+col_left, col_mid, col_right, col_tag = st.columns([1,1,1,1])
+
+# Tag (single word) placed aside with the fetch buttons
+with col_tag:
+    tag_input = st.text_input("Tag (one word)", value=st.session_state.subid_tag, help="Single word tag (will keep only first token).")
+    # keep only first token if user pasted multiple words
+    token = tag_input.strip().split()[0] if tag_input.strip() else ""
+    st.session_state.subid_tag = token
+
 # Count how many non-empty email rows we have available
 non_empty_creds = [r for i, r in st.session_state.creds_df.iterrows() if r.get("Email", "").strip()]
 available_accounts = max(1, len(non_empty_creds))
+
+with col_left:
+    # placeholder (Fetch controls are below but visually this aligns inputs)
+    st.write("")
+
+# The threshold input (kept here so it sits near the fetch buttons visually)
 required_accounts_count = st.number_input(
     "Require Sub-ID presence in at least N accounts (set N):",
     min_value=1,
@@ -254,7 +274,7 @@ required_accounts_count = st.number_input(
 if required_accounts_count > available_accounts:
     st.warning(f"You set N = {required_accounts_count}, but only {available_accounts} account(s) have non-empty Email. Please adjust N or add accounts.")
 
-# ---------- Fetch Controls ----------
+# ---------- Fetch Controls (buttons) ----------
 st.markdown("---")
 colA, colB, colC = st.columns([1, 1, 1])
 
@@ -291,7 +311,7 @@ with colA:
         else: st.warning("No valid credentials found in table.")
 
 with colB:
-    fetch_n = st.number_input("Fetch last N emails", min_value=1, value=10, step=1)
+    fetch_n = st.number_input("Fetch last N emails", min_value=1, value=10, step=1, key="fetch_n_input")
     if st.button("📥 Fetch Last N Emails"):
         if process_fetch('last_n', fetch_n): st.success(f"Fetched last {fetch_n} emails.")
         else: st.warning("No valid credentials found in table.")
@@ -320,7 +340,7 @@ else:
 
 st.markdown("---")
 
-# ---------- Email Presence Table (unchanged logic) ----------
+# ---------- Email Presence Table (exactly as before) ----------
 all_keys = set()
 email_presence_map = {}  # { email_address: set(message_keys) }
 new_email_keys = set()
@@ -330,6 +350,7 @@ for email_addr in valid_emails:
     df_acc = st.session_state.mailbox_data[email_addr]["df"]
     keys = set()
     for _, row in df_acc.iterrows():
+        # original presence key (unchanged)
         msg_key = (row["Domain"], row["Subject"], row["From"], row["SPF"], row["DKIM"], row["DMARC"], row.get("Sub ID", "-"))
         keys.add(msg_key)
         if row.get("is_new", False):
@@ -362,8 +383,8 @@ else:
 
 st.markdown("---")
 
-# ---------- NEW: Sub-ID Matches (only assets present in >= required_accounts_count accounts) ----------
-st.subheader(f"🔎 Sub-ID Matches (only assets present in ≥ {required_accounts_count} accounts)")
+# ---------- NEW: Sub-ID Matches (only assets present in ≥ N accounts AND have >=1 Sub-ID) ----------
+st.subheader(f"🔎 Sub-ID Matches (assets present in ≥ {required_accounts_count} accounts AND having Sub-ID(s))")
 
 # Build a mapping from asset-key (Domain, From, Subject) -> details across accounts
 asset_map = {}  # {(domain, from, subject): {"accounts": set(), "subids": set(), "rows": [row dicts]}}
@@ -387,13 +408,13 @@ for email_addr in valid_emails:
             "DMARC": r.get("DMARC")
         })
 
-# Now filter assets that meet the threshold
+# Now filter assets that meet the threshold AND have at least one Sub-ID
 subid_rows = []
 for (domain, from_val, subject), info in asset_map.items():
     present_count = len(info["accounts"])
-    if present_count >= required_accounts_count:
-        # Build a row that lists all subids (comma-separated) and which accounts have the message
-        subid_list = sorted(list(info["subids"])) if info["subids"] else []
+    has_subids = len(info["subids"]) > 0
+    if present_count >= required_accounts_count and has_subids:
+        subid_list = sorted(list(info["subids"]))
         accounts_list = sorted(list(info["accounts"]))
         row = {
             "Domain": domain,
@@ -403,7 +424,6 @@ for (domain, from_val, subject), info in asset_map.items():
             "Accounts": ", ".join([a.split('@')[0] for a in accounts_list]),
             "Sub IDs (all)": ", ".join(subid_list) if subid_list else "-"
         }
-        # Also include per-account tick columns for quick glance
         for email_addr in valid_emails:
             header = email_addr.split('@')[0]
             row[header] = "✅" if email_addr in info["accounts"] else "❌"
@@ -411,11 +431,10 @@ for (domain, from_val, subject), info in asset_map.items():
 
 if subid_rows:
     subid_df = pd.DataFrame(subid_rows)
-    # Sort by present count desc then domain
     subid_df = subid_df.sort_values(by=["Present In (Count)", "Domain"], ascending=[False, True], ignore_index=True)
     st.dataframe(subid_df, use_container_width=True)
 else:
-    st.info(f"No assets found that appear in at least {required_accounts_count} accounts. Adjust N or fetch more emails.")
+    st.info(f"No assets found that both contain Sub-IDs and appear in at least {required_accounts_count} accounts.")
 
 # ---------- Individual Raw Data (unchanged) ----------
 with st.expander("Show Individual Raw Messages"):
