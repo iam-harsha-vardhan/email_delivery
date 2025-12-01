@@ -1,6 +1,5 @@
 # app.py
 import streamlit as st
-import streamlit.components.v1 as components
 import imaplib
 import email
 from email.header import decode_header
@@ -11,7 +10,6 @@ import pandas as pd
 import pytz
 import base64
 import binascii
-import json
 from typing import List
 
 # ---------- Basic page ----------
@@ -27,24 +25,6 @@ if "creds_df" not in st.session_state:
     st.session_state.creds_df = pd.DataFrame([{"Email": "", "Password": ""}])
 if "mailbox_data" not in st.session_state:
     st.session_state.mailbox_data = {}  # {email: {"last_uid":..., "df": DataFrame, "uid_date_cache": {uid: datetime}}}
-
-# ---------- Column manager defaults ----------
-DEFAULT_SUBID_COLS = ["Domain","From","Subject","Sub ID","Time (IST)"]
-DEFAULT_PRESENCE_COLS = ["Domain","From","Subject","Sub ID (raw)","Time (IST)"]
-# per-account tick columns are appended dynamically at runtime
-
-# Layout storage key in localStorage
-LS_KEY = "inbox_layout_v1"
-
-# Initialize persisted layout state in session_state
-if "layout_settings" not in st.session_state:
-    st.session_state.layout_settings = {
-        "subid_visible": {c: True for c in DEFAULT_SUBID_COLS},
-        "subid_order": DEFAULT_SUBID_COLS.copy(),
-        "presence_visible": {c: True for c in DEFAULT_PRESENCE_COLS},
-        "presence_order": DEFAULT_PRESENCE_COLS.copy(),
-        "required_accounts_count": 4
-    }
 
 # ---------- Helper constructors ----------
 def get_empty_mailbox_structure():
@@ -175,6 +155,10 @@ def extract_subid_from_msg(msg):
 
 # ---------- IMAP batch helpers ----------
 def parse_fetch_parts_for_uid_and_date(fetch_response_parts) -> List[tuple]:
+    """
+    Given data returned by imap.uid('fetch', uid_seq, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
+    returns list of tuples (uid_str, raw_date_str_or_empty)
+    """
     results = []
     for part in fetch_response_parts:
         if not isinstance(part, tuple):
@@ -204,6 +188,10 @@ def parse_fetch_parts_for_uid_and_date(fetch_response_parts) -> List[tuple]:
 
 # ---------- Core fetch function (optimized) ----------
 def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None, fetch_unit='emails', uid_scan_limit=UID_SCAN_LIMIT, chunk_size=CHUNK_SIZE):
+    """
+    Returns DataFrame of matched headers and new_last_uid.
+    For fetch_unit in ('hours','minutes') uses batched UID FETCH to quickly find messages within cutoff.
+    """
     results = []
     new_last_uid = last_uid
     try:
@@ -240,6 +228,7 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                     uids = []
                 else:
                     uids_to_check = all_uids[-uid_scan_limit:] if len(all_uids) > uid_scan_limit else all_uids
+                    # Batch-fetch Date header for chunks and collect matching UIDs
                     matched_uids = []
                     for i in range(0, len(uids_to_check), chunk_size):
                         chunk = uids_to_check[i:i+chunk_size]
@@ -247,6 +236,7 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                         try:
                             res, fdata = imap.uid('fetch', uid_seq, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
                         except Exception:
+                            # fallback to per-UID fetch in this chunk
                             for u in chunk:
                                 try:
                                     uid_str = u.decode()
@@ -262,6 +252,7 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                                     continue
                             continue
 
+                        # parse parts -> list of (uid, raw_date)
                         parsed = parse_fetch_parts_for_uid_and_date(fdata)
                         for uid_str, raw_date in parsed:
                             if not raw_date:
@@ -280,10 +271,12 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
             else:
                 uids = []
 
+        # If nothing matched, just return empty DF
         if not uids:
             imap.logout()
             return pd.DataFrame(results), new_last_uid
 
+        # Now batch-fetch full headers for the matched uids in chunks (fast)
         fetch_uid_bytes = uids
         for i in range(0, len(fetch_uid_bytes), chunk_size):
             chunk = fetch_uid_bytes[i:i+chunk_size]
@@ -291,6 +284,7 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
             try:
                 res, fdata = imap.uid('fetch', uid_seq, '(BODY.PEEK[HEADER])')
             except Exception:
+                # Fallback: per-UID fetch for this chunk
                 for u in chunk:
                     try:
                         uid_s = u.decode()
@@ -298,6 +292,7 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                         if r2 != 'OK' or not md2 or not isinstance(md2[0], tuple):
                             continue
                         msg = email.message_from_bytes(md2[0][1])
+                        # parse header
                         subject = decode_mime_words(msg.get("Subject","No Subject"))
                         from_h = decode_mime_words(msg.get("From","-"))
                         domain = extract_domain_from_address(from_h)
@@ -319,6 +314,7 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                         continue
                 continue
 
+            # fdata contains tuples; iterate and parse each tuple
             for part in fdata:
                 if not isinstance(part, tuple):
                     continue
@@ -327,6 +323,7 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                     msg = email.message_from_bytes(hdr_bytes)
                 except Exception:
                     continue
+                # Try to extract UID from part[0] meta when available
                 uid_found = None
                 try:
                     meta = part[0].decode('utf-8', errors='ignore')
@@ -344,6 +341,7 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
                 formatted, dt = format_date_to_ist_string(raw_date)
                 uid_str = uid_found if uid_found else None
                 if uid_str is None:
+                    # in rare servers where UID not included, skip (most servers include UID)
                     continue
                 results.append({
                     "UID": uid_str,
@@ -370,7 +368,7 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
 
 # ---------- Styling ----------
 def highlight_new_rows(row):
-    return ['background-color: #0f9d58'] * len(row) if row.get("is_new", False) else [''] * len(row)
+    return ['background-color: #90EE90'] * len(row) if row.get("is_new", False) else [''] * len(row)
 
 def highlight_presence_row(row):
     # If auth failed, mark the entire row red (takes precedence)
@@ -380,169 +378,8 @@ def highlight_presence_row(row):
             return [style] * len(row)
     except Exception:
         pass
+    # else keep green if new, otherwise default
     return highlight_new_rows(row)
-
-# ---------- LocalStorage helpers (via a Streamlit HTML component) ----------
-# The component will post saved JSON back to Streamlit as the return value.
-def load_layout_from_localstorage():
-    """
-    Returns a dict (or None) read from browser localStorage under LS_KEY.
-    """
-    read_html = f"""
-    <html>
-      <body>
-        <script>
-          const key = "{LS_KEY}";
-          const val = window.localStorage.getItem(key);
-          const payload = val ? val : "";
-          // streamlit:setComponentValue protocol:
-          const msg = {{value: payload}};
-          window.parent.postMessage({{isStreamlitMessage: true, type: "streamlit:setComponentValue", value: payload}}, "*");
-        </script>
-      </body>
-    </html>
-    """
-    res = components.html(read_html, height=0, key="ls_read")
-    if res is None or res == "":
-        return None
-    try:
-        return json.loads(res)
-    except Exception:
-        return None
-
-def save_layout_to_localstorage(settings: dict):
-    """
-    Writes provided dict to localStorage under LS_KEY and returns True/False.
-    """
-    encoded = json.dumps(settings).replace("</", "<\\/")  # avoid HTML close tag issues
-    write_html = f"""
-    <html>
-      <body>
-        <script>
-          try {{
-            const key = "{LS_KEY}";
-            const payload = {encoded};
-            window.localStorage.setItem(key, JSON.stringify(payload));
-            window.parent.postMessage({{isStreamlitMessage: true, type: "streamlit:setComponentValue", value: "OK" }}, "*");
-          }} catch(e) {{
-            window.parent.postMessage({{isStreamlitMessage: true, type: "streamlit:setComponentValue", value: "ERR" }}, "*");
-          }}
-        </script>
-      </body>
-    </html>
-    """
-    res = components.html(write_html, height=0, key=f"ls_write_{hash(encoded) % 999999}")
-    return res == "OK"
-
-def reset_layout_to_defaults():
-    st.session_state.layout_settings = {
-        "subid_visible": {c: True for c in DEFAULT_SUBID_COLS},
-        "subid_order": DEFAULT_SUBID_COLS.copy(),
-        "presence_visible": {c: True for c in DEFAULT_PRESENCE_COLS},
-        "presence_order": DEFAULT_PRESENCE_COLS.copy(),
-        "required_accounts_count": st.session_state.layout_settings.get("required_accounts_count", 4)
-    }
-
-# ---------- UI: Column Manager (persisted) ----------
-st.markdown("### ⚙️ Column Manager (hide / unhide / reorder — saved to browser)")
-cm_col1, cm_col2 = st.columns([2, 3])
-
-with cm_col1:
-    st.caption("Sub-ID table columns (drag simulated via Up/Down):")
-    # show order and visibility controls for subid table
-    sub_order = st.session_state.layout_settings["subid_order"]
-    sub_visible = st.session_state.layout_settings["subid_visible"]
-    # Render controls
-    for idx, col in enumerate(sub_order):
-        cols = st.columns([0.6, 3, 0.6, 0.6, 0.6])
-        with cols[1]:
-            st.write(f"**{col}**")
-        with cols[0]:
-            vis = st.checkbox("", value=sub_visible.get(col, True), key=f"sub_vis_{col}")
-            st.session_state.layout_settings["subid_visible"][col] = vis
-        # move up
-        if cols[2].button("↑", key=f"sub_up_{col}"):
-            if idx > 0:
-                sub_order[idx-1], sub_order[idx] = sub_order[idx], sub_order[idx-1]
-                st.session_state.layout_settings["subid_order"] = sub_order
-                st.experimental_rerun()
-        # move down
-        if cols[3].button("↓", key=f"sub_down_{col}"):
-            if idx < len(sub_order)-1:
-                sub_order[idx+1], sub_order[idx] = sub_order[idx], sub_order[idx+1]
-                st.session_state.layout_settings["subid_order"] = sub_order
-                st.experimental_rerun()
-        # remove (hide)
-        if cols[4].button("Hide", key=f"sub_hide_{col}"):
-            st.session_state.layout_settings["subid_visible"][col] = False
-            st.experimental_rerun()
-
-with cm_col2:
-    st.caption("Presence table columns (hide / show / reorder):")
-    pres_order = st.session_state.layout_settings["presence_order"]
-    pres_visible = st.session_state.layout_settings["presence_visible"]
-    for idx, col in enumerate(pres_order):
-        cols = st.columns([0.6, 3, 0.6, 0.6, 0.6])
-        with cols[1]:
-            st.write(f"**{col}**")
-        with cols[0]:
-            vis = st.checkbox("", value=pres_visible.get(col, True), key=f"pres_vis_{col}")
-            st.session_state.layout_settings["presence_visible"][col] = vis
-        if cols[2].button("↑", key=f"pres_up_{col}"):
-            if idx > 0:
-                pres_order[idx-1], pres_order[idx] = pres_order[idx], pres_order[idx-1]
-                st.session_state.layout_settings["presence_order"] = pres_order
-                st.experimental_rerun()
-        if cols[3].button("↓", key=f"pres_down_{col}"):
-            if idx < len(pres_order)-1:
-                pres_order[idx+1], pres_order[idx] = pres_order[idx], pres_order[idx+1]
-                st.session_state.layout_settings["presence_order"] = pres_order
-                st.experimental_rerun()
-        if cols[4].button("Hide", key=f"pres_hide_{col}"):
-            st.session_state.layout_settings["presence_visible"][col] = False
-            st.experimental_rerun()
-
-# controls: Save / Load / Reset / Export / Import
-ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1,1,2])
-with ctrl_col1:
-    if st.button("Save layout to browser"):
-        ok = save_layout_to_localstorage(st.session_state.layout_settings)
-        if ok:
-            st.success("Layout saved to browser localStorage.")
-        else:
-            st.error("Failed to save layout to browser.")
-with ctrl_col2:
-    if st.button("Load layout from browser"):
-        loaded = load_layout_from_localstorage()
-        if loaded:
-            st.session_state.layout_settings = loaded
-            st.success("Layout loaded from browser. Re-rendering.")
-            st.experimental_rerun()
-        else:
-            st.info("No saved layout found in browser.")
-with ctrl_col3:
-    if st.button("Reset to defaults"):
-        reset_layout_to_defaults()
-        st.success("Reset layout to defaults.")
-    uploaded = st.file_uploader("Import layout JSON", type=["json"], label_visibility="collapsed")
-    if uploaded is not None:
-        try:
-            j = json.load(uploaded)
-            st.session_state.layout_settings = j
-            st.success("Imported layout. Re-rendering.")
-            st.experimental_rerun()
-        except Exception as e:
-            st.error(f"Invalid JSON file: {e}")
-
-export_col1, export_col2 = st.columns([1,1])
-with export_col1:
-    if st.button("Export layout JSON"):
-        js = json.dumps(st.session_state.layout_settings, indent=2)
-        st.download_button("Download JSON", js, file_name="inbox_layout.json", mime="application/json")
-with export_col2:
-    st.caption("Hint: Move columns, toggles take effect immediately. Save layout to make it persistent across reloads.")
-
-st.markdown("---")
 
 # ---------- UI: accounts ----------
 st.markdown("### 📋 Account Credentials")
@@ -555,7 +392,7 @@ column_config = {
 edited_df = st.data_editor(st.session_state.creds_df, num_rows="dynamic", column_config=column_config, key="editor", use_container_width=True, hide_index=True)
 st.session_state.creds_df = edited_df
 
-# ---------- Exposed process_fetch (no changes) ----------
+# ---------- Exposed process_fetch ----------
 def process_fetch(fetch_type, fetch_n=None, fetch_unit='emails'):
     any_run = False
     for i, r in st.session_state.creds_df.iterrows():
@@ -566,6 +403,7 @@ def process_fetch(fetch_type, fetch_n=None, fetch_unit='emails'):
         if email_addr not in st.session_state.mailbox_data:
             st.session_state.mailbox_data[email_addr] = get_empty_mailbox_structure()
         mailbox = st.session_state.mailbox_data[email_addr]
+        # reset is_new flags
         if "is_new" in mailbox["df"].columns:
             mailbox["df"]["is_new"] = False
         any_run = True
@@ -603,15 +441,13 @@ with col_f3:
     non_empty = [r for _, r in st.session_state.creds_df.iterrows() if r.get("Email","").strip()]
     avail = max(1, len(non_empty))
     default_n = 4 if avail >=4 else avail
-    # synchronize required_accounts_count with layout_settings
-    req_n = st.number_input("Require Sub-ID presence in at least N accounts", min_value=1, max_value=avail, value=st.session_state.layout_settings.get("required_accounts_count", default_n), step=1, key="req_n_sync")
-    st.session_state.layout_settings["required_accounts_count"] = int(req_n)
+    required_accounts_count = st.number_input("Require Sub-ID presence in at least N accounts", min_value=1, max_value=avail, value=default_n, step=1, key="req_n")
 
 with col_f4:
     if st.button("🗑️ Clear All"):
         st.session_state.mailbox_data = {}
         st.success("Cleared all fetched emails.")
-        st.experimental_rerun()
+        st.rerun()
 
 st.markdown("---")
 
@@ -638,7 +474,7 @@ email_presence_map = {}
 new_email_keys = set()
 valid_emails = [r["Email"] for _, r in st.session_state.creds_df.iterrows() if r["Email"] in st.session_state.mailbox_data]
 
-asset_map = {}
+asset_map = {}  # {(domain,from,subject): {"accounts":set(),"subids":set(),"rows":[...]}}
 
 for email_addr in valid_emails:
     df_acc = st.session_state.mailbox_data[email_addr]["df"]
@@ -654,6 +490,7 @@ for email_addr in valid_emails:
         sid = row.get("Sub ID","-")
         if sid and sid != "-":
             asset["subids"].add(sid)
+        # include SPF/DKIM/DMARC in rows so we can evaluate auth per occurrence
         asset["rows"].append({
             "account": email_addr,
             "UID": row.get("UID"),
@@ -670,28 +507,32 @@ for email_addr in valid_emails:
     all_keys.update(keys)
 
 # ---------- TOP: Sub-ID table (one row per subid) with Time (IST) sorted desc ----------
-required_accounts_count = st.session_state.layout_settings.get("required_accounts_count", 4)
 st.subheader(f"🔎 Sub-ID Consensus (≥ {required_accounts_count} accounts)")
 
 subid_rows = []
 for (domain, from_val, subject), info in asset_map.items():
+    # asset must be present in >= required_accounts_count accounts
     if len(info["accounts"]) < required_accounts_count:
         continue
     for subid in sorted(list(info["subids"])):
+        # which accounts have this specific subid?
         subid_rows_for_asset = [r for r in info["rows"] if (r.get("Sub ID") or "-") == subid]
         subid_accounts = {r["account"] for r in subid_rows_for_asset}
+        # must appear in >= required_accounts_count accounts
         if len(subid_accounts) < required_accounts_count:
             continue
 
-        # requirement: all occurrences for this subid must have SPF/DKIM/DMARC == pass
+        # requirement: for every occurrence of this subid, SPF, DKIM, DMARC must be 'pass'
         all_auth_pass = True
         for r in subid_rows_for_asset:
             if not (str(r.get("SPF","")).lower() == "pass" and str(r.get("DKIM","")).lower() == "pass" and str(r.get("DMARC","")).lower() == "pass"):
                 all_auth_pass = False
                 break
         if not all_auth_pass:
+            # skip this subid from main table if any occurrence failed auth
             continue
 
+        # find latest time among rows for this subid
         latest_dt = None
         latest_str = "-"
         any_new = False
@@ -708,16 +549,14 @@ for (domain, from_val, subject), info in asset_map.items():
             row[em.split('@')[0]] = "✅" if em in subid_accounts else "❌"
         subid_rows.append((latest_dt, row))
 
+# sort by latest_dt desc
 subid_rows_sorted = [r for _,r in sorted(subid_rows, key=lambda x: (x[0] is None, x[0]), reverse=True)]
 if subid_rows_sorted:
     subid_df = pd.DataFrame(subid_rows_sorted)
     per_acc_cols = [e.split('@')[0] for e in valid_emails]
-    # build display cols based on layout settings
-    sub_order = st.session_state.layout_settings.get("subid_order", DEFAULT_SUBID_COLS)
-    sub_vis = st.session_state.layout_settings.get("subid_visible", {c: True for c in DEFAULT_SUBID_COLS})
-    display_cols = [c for c in sub_order if sub_vis.get(c, True)]
-    display_cols = display_cols + per_acc_cols + ["is_new"]
+    display_cols = ["Domain","From","Subject","Sub ID","Time (IST)"] + per_acc_cols + ["is_new"]
     subid_df = subid_df.reindex(columns=display_cols, fill_value="-")
+    # Render full-width
     st.dataframe(subid_df.style.apply(highlight_new_rows, axis=1), hide_index=True, column_config={"is_new": None}, use_container_width=True)
 else:
     st.info(f"No Sub-IDs that meet the threshold of {required_accounts_count} accounts with all auths passing.")
@@ -739,8 +578,10 @@ rows = []
 if all_keys:
     sorted_keys = sorted(list(all_keys), key=lambda k: (k not in new_email_keys, k[0], k[1]))
     for (domain, subject, from_val, spf, dkim, dmarc, subid) in sorted_keys:
+        # compute latest time for this presence row
         latest_dt = None
         latest_str = "-"
+        # keep a per-row auth aggregator: if any occurrence of this presence key had failed auth, the row is considered Fail
         auth_pass_for_row = True
         for em in valid_emails:
             df_acc = st.session_state.mailbox_data[em]["df"]
@@ -752,6 +593,7 @@ if all_keys:
                 if dt is not None and (latest_dt is None or dt > latest_dt):
                     latest_dt = dt
                     latest_str = m.get("Date") or latest_str
+                # if any of SPF/DKIM/DMARC != 'pass' -> mark as fail for row
                 if not (str(m.get("SPF","")).lower() == "pass" and str(m.get("DKIM","")).lower() == "pass" and str(m.get("DMARC","")).lower() == "pass"):
                     auth_pass_for_row = False
 
@@ -771,14 +613,11 @@ if all_keys:
     presence_df = pd.DataFrame(rows)
     if "Date_dt_sort" in presence_df.columns:
         presence_df = presence_df.sort_values(by=["Date_dt_sort"], ascending=False, na_position='last', ignore_index=True)
-
+    # Render full-width (same size as Sub-ID table)
     st.subheader("📋 Email Presence Table (Newest on Top)")
     if not presence_df.empty:
-        per_acc_cols = [e.split('@')[0] for e in valid_emails]
-        pres_order = st.session_state.layout_settings.get("presence_order", DEFAULT_PRESENCE_COLS)
-        pres_vis = st.session_state.layout_settings.get("presence_visible", {c: True for c in DEFAULT_PRESENCE_COLS})
-        display_cols = [c for c in pres_order if pres_vis.get(c, True)]
-        display_cols = display_cols + per_acc_cols + ["Sub IDs (qualifying)","Auth","is_new"]
+        per_account_cols = [e.split('@')[0] for e in valid_emails]
+        display_cols = ["Domain","From","Subject","Sub ID (raw)","Time (IST)"] + per_account_cols + ["Sub IDs (qualifying)","Auth","is_new"]
         presence_df = presence_df.reindex(columns=display_cols, fill_value="-")
         st.dataframe(presence_df.style.apply(highlight_presence_row, axis=1), hide_index=True, column_config={"is_new": None}, use_container_width=True)
     else:
