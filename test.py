@@ -13,8 +13,8 @@ import binascii
 from typing import List
 
 # ---------- Basic page ----------
-st.set_page_config(page_title="Fast IMAP Sub-ID Fetcher", layout="wide")
-st.title("⚡ Fast IMAP: last N minutes (batched) + Sub-ID Consensus")
+st.set_page_config(page_title="Dynamic Multi-Account Inbox Comparator", layout="wide")
+st.title("📧 Dynamic Multi-Account Inbox Comparator")
 
 # ---------- Configurable defaults (no UI knobs shown) ----------
 UID_SCAN_LIMIT = 2000  # how many recent UIDs to scan when using time windows
@@ -370,6 +370,17 @@ def fetch_inbox_emails_single(email_addr, password, last_uid=None, fetch_n=None,
 def highlight_new_rows(row):
     return ['background-color: #90EE90'] * len(row) if row.get("is_new", False) else [''] * len(row)
 
+def highlight_presence_row(row):
+    # If auth failed, mark the entire row red (takes precedence)
+    try:
+        if str(row.get("Auth", "")).lower() != "pass":
+            style = 'background-color: rgba(255, 0, 0, 0.15)'
+            return [style] * len(row)
+    except Exception:
+        pass
+    # else keep green if new, otherwise default
+    return highlight_new_rows(row)
+
 # ---------- UI: accounts ----------
 st.markdown("### 📋 Account Credentials")
 st.info("Add accounts (App Password recommended for Gmail).")
@@ -479,6 +490,7 @@ for email_addr in valid_emails:
         sid = row.get("Sub ID","-")
         if sid and sid != "-":
             asset["subids"].add(sid)
+        # include SPF/DKIM/DMARC in rows so we can evaluate auth per occurrence
         asset["rows"].append({
             "account": email_addr,
             "UID": row.get("UID"),
@@ -486,6 +498,9 @@ for email_addr in valid_emails:
             "Date": row.get("Date"),
             "Date_dt": row.get("Date_dt"),
             "Sub ID": sid or "-",
+            "SPF": row.get("SPF"),
+            "DKIM": row.get("DKIM"),
+            "DMARC": row.get("DMARC"),
             "is_new": bool(row.get("is_new", False))
         })
     email_presence_map[email_addr] = keys
@@ -496,24 +511,39 @@ st.subheader(f"🔎 Sub-ID Consensus (≥ {required_accounts_count} accounts)")
 
 subid_rows = []
 for (domain, from_val, subject), info in asset_map.items():
+    # asset must be present in >= required_accounts_count accounts
     if len(info["accounts"]) < required_accounts_count:
         continue
     for subid in sorted(list(info["subids"])):
-        subid_accounts = {r["account"] for r in info["rows"] if (r.get("Sub ID") or "-") == subid}
+        # which accounts have this specific subid?
+        subid_rows_for_asset = [r for r in info["rows"] if (r.get("Sub ID") or "-") == subid]
+        subid_accounts = {r["account"] for r in subid_rows_for_asset}
+        # must appear in >= required_accounts_count accounts
         if len(subid_accounts) < required_accounts_count:
             continue
+
+        # requirement: for every occurrence of this subid, SPF, DKIM, DMARC must be 'pass'
+        all_auth_pass = True
+        for r in subid_rows_for_asset:
+            if not (str(r.get("SPF","")).lower() == "pass" and str(r.get("DKIM","")).lower() == "pass" and str(r.get("DMARC","")).lower() == "pass"):
+                all_auth_pass = False
+                break
+        if not all_auth_pass:
+            # skip this subid from main table if any occurrence failed auth
+            continue
+
         # find latest time among rows for this subid
         latest_dt = None
         latest_str = "-"
         any_new = False
-        for r in info["rows"]:
-            if (r.get("Sub ID") or "-") == subid:
-                dt = r.get("Date_dt")
-                if dt is not None and (latest_dt is None or dt > latest_dt):
-                    latest_dt = dt
-                    latest_str = r.get("Date") or latest_str
-                if r.get("is_new", False):
-                    any_new = True
+        for r in subid_rows_for_asset:
+            dt = r.get("Date_dt")
+            if dt is not None and (latest_dt is None or dt > latest_dt):
+                latest_dt = dt
+                latest_str = r.get("Date") or latest_str
+            if r.get("is_new", False):
+                any_new = True
+
         row = {"Domain": domain, "From": from_val, "Subject": subject, "Sub ID": subid, "Time (IST)": latest_str, "is_new": any_new}
         for em in valid_emails:
             row[em.split('@')[0]] = "✅" if em in subid_accounts else "❌"
@@ -526,9 +556,10 @@ if subid_rows_sorted:
     per_acc_cols = [e.split('@')[0] for e in valid_emails]
     display_cols = ["Domain","From","Subject","Sub ID","Time (IST)"] + per_acc_cols + ["is_new"]
     subid_df = subid_df.reindex(columns=display_cols, fill_value="-")
+    # Render full-width
     st.dataframe(subid_df.style.apply(highlight_new_rows, axis=1), hide_index=True, column_config={"is_new": None}, use_container_width=True)
 else:
-    st.info(f"No Sub-IDs that meet the threshold of {required_accounts_count} accounts.")
+    st.info(f"No Sub-IDs that meet the threshold of {required_accounts_count} accounts with all auths passing.")
 
 st.markdown("---")
 
@@ -538,7 +569,8 @@ for (domain, from_val, subject), info in asset_map.items():
     if len(info["accounts"]) < required_accounts_count:
         continue
     for subid in info["subids"]:
-        subid_accounts = {r["account"] for r in info["rows"] if (r.get("Sub ID") or "-") == subid}
+        subid_rows_for_asset = [r for r in info["rows"] if (r.get("Sub ID") or "-") == subid]
+        subid_accounts = {r["account"] for r in subid_rows_for_asset}
         if len(subid_accounts) >= required_accounts_count:
             qualifying_subids.setdefault((domain, from_val, subject), []).append(subid)
 
@@ -549,6 +581,8 @@ if all_keys:
         # compute latest time for this presence row
         latest_dt = None
         latest_str = "-"
+        # keep a per-row auth aggregator: if any occurrence of this presence key had failed auth, the row is considered Fail
+        auth_pass_for_row = True
         for em in valid_emails:
             df_acc = st.session_state.mailbox_data[em]["df"]
             matches = df_acc[
@@ -559,12 +593,16 @@ if all_keys:
                 if dt is not None and (latest_dt is None or dt > latest_dt):
                     latest_dt = dt
                     latest_str = m.get("Date") or latest_str
+                # if any of SPF/DKIM/DMARC != 'pass' -> mark as fail for row
+                if not (str(m.get("SPF","")).lower() == "pass" and str(m.get("DKIM","")).lower() == "pass" and str(m.get("DMARC","")).lower() == "pass"):
+                    auth_pass_for_row = False
+
         qual_key = (domain, from_val, subject)
         qual_list = qualifying_subids.get(qual_key, [])
         subids_cell = ", ".join(qual_list) if qual_list else "-"
         row = {
             "Domain": domain, "From": from_val, "Subject": subject, "Sub ID (raw)": subid,
-            "Time (IST)": latest_str, "Auth": "Pass" if all(x=='pass' for x in [spf, dkim, dmarc]) else "Fail",
+            "Time (IST)": latest_str, "Auth": "Pass" if auth_pass_for_row else "Fail",
             "Sub IDs (qualifying)": subids_cell,
             "is_new": (domain, subject, from_val, spf, dkim, dmarc, subid) in new_email_keys,
             "Date_dt_sort": latest_dt
@@ -575,16 +613,15 @@ if all_keys:
     presence_df = pd.DataFrame(rows)
     if "Date_dt_sort" in presence_df.columns:
         presence_df = presence_df.sort_values(by=["Date_dt_sort"], ascending=False, na_position='last', ignore_index=True)
-    left_col, mid_col, right_col = st.columns([1,8,1])
-    with mid_col:
-        st.subheader("📋 Email Presence Table (Newest on Top)")
-        if not presence_df.empty:
-            per_account_cols = [e.split('@')[0] for e in valid_emails]
-            display_cols = ["Domain","From","Subject","Sub ID (raw)","Time (IST)"] + per_account_cols + ["Sub IDs (qualifying)","is_new"]
-            presence_df = presence_df.reindex(columns=display_cols, fill_value="-")
-            st.dataframe(presence_df.style.apply(highlight_new_rows, axis=1), hide_index=True, column_config={"is_new": None}, use_container_width=True)
-        else:
-            st.info("No presence rows to show.")
+    # Render full-width (same size as Sub-ID table)
+    st.subheader("📋 Email Presence Table (Newest on Top)")
+    if not presence_df.empty:
+        per_account_cols = [e.split('@')[0] for e in valid_emails]
+        display_cols = ["Domain","From","Subject","Sub ID (raw)","Time (IST)"] + per_account_cols + ["Sub IDs (qualifying)","Auth","is_new"]
+        presence_df = presence_df.reindex(columns=display_cols, fill_value="-")
+        st.dataframe(presence_df.style.apply(highlight_presence_row, axis=1), hide_index=True, column_config={"is_new": None}, use_container_width=True)
+    else:
+        st.info("No presence rows to show.")
 else:
     st.info("No emails found in the active accounts.")
 
