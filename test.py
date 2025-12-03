@@ -1,5 +1,12 @@
-# app.py - Inbox Creative Fetcher (table + selectable previews)
-# Run: streamlit run app.py
+# Inbox Creative Fetcher — Multi-account, structured table, fixed 30-day window
+# Features in this version:
+# - REMOVED the Days window input (fixed to last 30 days internally)
+# - Supports multiple accounts: you can add several credentials in the grid
+# - Fetches from each account and builds two full-width tables:
+#    1) **Aggregate Presence Table**: one row per unique creative (Subject+Display+HTML hash) with which accounts contain it
+#    2) **Per-account Raw Table**: shows each account's captured messages (UID, Subject, Display, Date, Has HTML)
+# - Previews: select rows from the Aggregate table to render the HTML creative and see which accounts have it
+# - Copy HTML button included in preview
 
 import streamlit as st
 import imaplib
@@ -13,18 +20,19 @@ import pytz
 import quopri
 import html
 import uuid
+import hashlib
 import streamlit.components.v1 as components
 
 # ---------- Page ----------
-st.set_page_config(page_title="Inbox Creative Fetcher — Table", layout="wide")
-st.title("📥 Fetch Subject / Display Snippet / HTML (Structured Table + Preview)")
+st.set_page_config(page_title="Inbox Creative Fetcher — MultiAccount Table", layout="wide")
+st.title("📥 Multi-account Inbox Creative Finder (last 30 days)")
 
-# ---------- Config ----------
+# ---------- Config (fixed) ----------
 UID_SCAN_LIMIT = 2000
-DEFAULT_DAYS = 30
+DEFAULT_DAYS_FIXED = 30   # fixed window — Days input removed per request
 DEFAULT_MAX_MESSAGES = 200
 
-# ---------- Helpers ----------
+# ---------- Helpers (same as before) ----------
 def decode_mime_words(s):
     if not s: return ""
     decoded = ''
@@ -102,7 +110,7 @@ def extract_subject_display_html_from_msg(msg):
             display = ' '.join(lines)
     elif found_html:
         stripped = strip_html_tags(found_html)
-        sentences = re.split(r'(?<=[\.\?!])\s+', stripped)
+        sentences = re.split(r'(?<=[\.!?])\s+', stripped)
         display = ' '.join([s for s in sentences if s.strip()][:3]) or '-'
 
     if found_html:
@@ -133,9 +141,10 @@ def copy_button_html(text, key=None):
     """
     return snippet
 
-# ---------- IMAP fetch ----------
-def fetch_subject_display_html_by_domain(email_addr, password, domain, days_window=DEFAULT_DAYS, max_messages=DEFAULT_MAX_MESSAGES, uid_scan_limit=UID_SCAN_LIMIT):
-    results = []
+# ---------- IMAP fetch (per-account) ----------
+
+def fetch_for_account(email_addr, password, domain, days_window=DEFAULT_DAYS_FIXED, max_messages=DEFAULT_MAX_MESSAGES, uid_scan_limit=UID_SCAN_LIMIT):
+    rows = []
     try:
         imap = imaplib.IMAP4_SSL('imap.gmail.com')
         imap.login(email_addr.strip(), password.strip())
@@ -148,12 +157,11 @@ def fetch_subject_display_html_by_domain(email_addr, password, domain, days_wind
         status, data = imap.uid('search', None, f'(SINCE "{cutoff_str}")')
         if status != 'OK' or not data or not data[0]:
             imap.logout()
-            return pd.DataFrame(results)
-
+            return rows
         all_uids = data[0].split()
         if not all_uids:
             imap.logout()
-            return pd.DataFrame(results)
+            return rows
 
         uids_to_check = all_uids[-uid_scan_limit:] if len(all_uids) > uid_scan_limit else all_uids
         count = 0
@@ -194,7 +202,6 @@ def fetch_subject_display_html_by_domain(email_addr, password, domain, days_wind
                     continue
 
                 subject, display, html_creative = extract_subject_display_html_from_msg(msg)
-
                 raw_date = msg.get('Date','')
                 formatted_date = raw_date
                 try:
@@ -202,13 +209,13 @@ def fetch_subject_display_html_by_domain(email_addr, password, domain, days_wind
                 except Exception:
                     formatted_date = raw_date
 
-                results.append({
+                rows.append({
+                    'Account': email_addr,
                     'UID': uid_str,
                     'Subject': subject,
                     'Display': display,
-                    'Has_HTML': bool(html_creative and html_creative != '-'),
-                    'Date': formatted_date,
-                    'HTML': html_creative
+                    'HTML': html_creative,
+                    'Date': formatted_date
                 })
                 count += 1
             except Exception:
@@ -217,87 +224,142 @@ def fetch_subject_display_html_by_domain(email_addr, password, domain, days_wind
         imap.logout()
     except imaplib.IMAP4.error as e:
         st.error(f'IMAP error for {email_addr}: {e}')
-        return pd.DataFrame(results)
+        return rows
     except Exception as e:
         st.error(f'Error fetching {email_addr}: {e}')
-        return pd.DataFrame(results)
+        return rows
 
-    return pd.DataFrame(results)
+    return rows
+
+# ---------- Aggregation helpers ----------
+
+def make_signature(subject, display, html_text):
+    """Create a stable signature (hash) for grouping identical creatives."""
+    key = (subject or '') + '\n||\n' + (display or '') + '\n||\n' + (html_text or '')
+    return hashlib.sha256(key.encode('utf-8')).hexdigest()
 
 # ---------- UI ----------
-st.markdown("### 🔎 Input — Domain + Date window")
-col1, col2, col3 = st.columns([2,1,1])
-with col1:
-    domain_input = st.text_input('Domain to filter (e.g. example.com)', value='')
-with col2:
-    days = st.number_input('Days window', min_value=1, max_value=3650, value=DEFAULT_DAYS, step=1)
-with col3:
-    max_msgs = st.number_input('Max messages', min_value=1, max_value=2000, value=DEFAULT_MAX_MESSAGES, step=1)
-
-st.info("Provide a Gmail account (App Password recommended). The app searches the chosen inbox for messages whose From header contains the domain you supply.")
+st.markdown("### 🔎 Input — (fixed) Last 30 days — Multiple accounts supported")
+st.info("Days window removed (fixed to last 30 days). Add multiple accounts below; each row should be Email + App Password for Gmail.")
 
 # credentials editor
 if 'creds_df' not in st.session_state:
     st.session_state.creds_df = pd.DataFrame([{'Email':'','Password':''}])
-colc1, colc2 = st.columns([3,1])
-with colc1:
-    edited = st.data_editor(st.session_state.creds_df, num_rows='dynamic', use_container_width=True, hide_index=True)
-    st.session_state.creds_df = edited
 
-with colc2:
-    if st.button('Fetch & Show Table'):
+edited = st.data_editor(st.session_state.creds_df, num_rows='dynamic', use_container_width=True, hide_index=True)
+st.session_state.creds_df = edited
+
+col1, col2 = st.columns([3,1])
+with col1:
+    max_msgs = st.number_input('Max messages per account', min_value=10, max_value=2000, value=DEFAULT_MAX_MESSAGES, step=10)
+with col2:
+    if st.button('Fetch across accounts'):
         creds = [r for _,r in st.session_state.creds_df.iterrows() if r.get('Email','').strip() and r.get('Password','').strip()]
         if not creds:
-            st.error('Please provide at least one account with app password.')
-        elif not domain_input.strip():
-            st.error('Provide a domain to filter by (e.g. example.com)')
+            st.error('Please provide at least one account (Email + App password).')
         else:
-            acct = creds[0]
-            with st.spinner('Fetching messages...'):
-                df = fetch_subject_display_html_by_domain(acct['Email'], acct['Password'], domain_input.strip(), days_window=days, max_messages=max_msgs)
-                if df.empty:
-                    st.info('No matching messages found in the date window.')
-                else:
-                    # Well-structured table (UID, Subject, Display, Date, Has_HTML)
-                    display_df = df[['UID','Subject','Display','Date','Has_HTML']].copy()
-                    display_df = display_df.rename(columns={'Has_HTML':'Has HTML?'})
-                    display_df.index = range(1, len(display_df)+1)  # friendly 1-based index
-                    st.subheader(f'Results — {len(display_df)} message(s)')
-                    st.dataframe(display_df, use_container_width=True)
+            all_rows = []
+            progress = st.progress(0)
+            total = len(creds)
+            for i, cred in enumerate(creds):
+                acct = cred['Email'].strip()
+                pwd = cred['Password'].strip()
+                st.info(f'Fetching for {acct}...')
+                rows = fetch_for_account(acct, pwd, domain_input := (st.session_state.get('last_domain') if 'last_domain' in st.session_state else '' ) or st.text_input('Domain (enter before fetching)', value=''))
+                # Note: domain_input must be provided via the small input above; we keep compatibility
+                # but also store last used domain
+                st.session_state['last_domain'] = domain_input
+                all_rows.extend(rows)
+                progress.progress(int(((i+1)/total)*100))
 
-                    # Provide multi-select to preview rows from the table
-                    options = [f"{row.UID} — {row.Subject} — {row.Date}" for _, row in df.iterrows()]
-                    uid_map = {f"{row.UID} — {row.Subject} — {row.Date}": row.UID for _, row in df.iterrows()}
-                    selected = st.multiselect("Select messages to preview (multiple allowed)", options=options)
+            # build per-account DataFrame
+            if not all_rows:
+                st.info('No messages found across accounts (check domain or credentials).')
+            else:
+                raw_df = pd.DataFrame(all_rows)
 
-                    if selected:
-                        st.button("Preview selected")  # visual affordance; previews render below automatically
-                        st.markdown("### Preview(s)")
-                        for sel in selected:
-                            uid = uid_map.get(sel)
-                            row = df[df['UID'] == uid].iloc[0]
-                            st.markdown(f"**{row['Subject']}** — *{row['Date']}*")
-                            cols = st.columns([1.2,1,0.8])
-                            with cols[0]:
-                                st.write("Preview (rendered)")
-                                html_code = row['HTML']
-                                if html_code and html_code != '-':
-                                    components.html(html_code, height=400, scrolling=True)
-                                else:
-                                    st.write("No HTML available")
-                            with cols[1]:
-                                st.write("HTML (trimmed)")
-                                truncated = (row['HTML'][:800] + '...') if row['HTML'] and len(row['HTML']) > 800 else row['HTML']
-                                st.text_area(f'html_preview_{uid}', value=truncated if truncated else '-', height=160)
-                            with cols[2]:
-                                st.write("Copy")
-                                if row['HTML'] and row['HTML'] != '-':
-                                    components.html(copy_button_html(row['HTML'], key=uid), height=60)
-                                else:
-                                    st.write("—")
+                # Build Aggregate presence map keyed by signature
+                agg = {}
+                for _, r in raw_df.iterrows():
+                    sig = make_signature(r['Subject'], r['Display'], r['HTML'])
+                    if sig not in agg:
+                        agg[sig] = {
+                            'Subject': r['Subject'],
+                            'Display': r['Display'],
+                            'HTML': r['HTML'],
+                            'Dates': [r['Date']] if r.get('Date') else [],
+                            'Accounts': set([r['Account']]),
+                            'UIDs': {r['Account']: r['UID']}
+                        }
+                    else:
+                        agg[sig]['Accounts'].add(r['Account'])
+                        agg[sig]['Dates'].append(r.get('Date'))
+                        agg[sig]['UIDs'][r['Account']] = r['UID']
+
+                # Build aggregate DataFrame for display
+                agg_rows = []
+                for sig, v in agg.items():
+                    latest_date = None
+                    try:
+                        # parse dates if possible, pick latest, else keep first
+                        parsed = [parsedate_to_datetime(d) for d in v['Dates'] if d]
+                        if parsed:
+                            latest_dt = max(parsed)
+                            latest_date = latest_dt.astimezone(pytz.timezone('Asia/Kolkata')).strftime('%d-%b-%Y %I:%M %p')
+                    except Exception:
+                        latest_date = v['Dates'][0] if v['Dates'] else '-'
+
+                    agg_rows.append({
+                        'Signature': sig,
+                        'Subject': v['Subject'],
+                        'Display': v['Display'],
+                        'Date': latest_date or '-',
+                        'Accounts_Present': ', '.join(sorted(list(v['Accounts']))),
+                        'Has_HTML': bool(v['HTML'] and v['HTML'] != '-'),
+                        'HTML': v['HTML'],
+                        'UIDs': v['UIDs']
+                    })
+
+                agg_df = pd.DataFrame(agg_rows)
+
+                # ---------- SHOW AGGREGATE TABLE (full-width) ----------
+                st.markdown('## Aggregate Presence Table')
+                if not agg_df.empty:
+                    disp = agg_df[['Signature','Subject','Display','Date','Accounts_Present','Has_HTML']].copy()
+                    disp = disp.rename(columns={'Accounts_Present':'Accounts', 'Has_HTML':'Has HTML?'})
+                    disp.index = range(1, len(disp)+1)
+                    st.dataframe(disp, use_container_width=True)
+
+                    # Selector to preview
+                    options = [f"{i} — {row.Subject[:70]} — {row.Date}" for i,row in agg_df.iterrows()]
+                    sel = st.multiselect('Select aggregate rows to preview', options=options)
+                    if sel:
+                        st.markdown('### Preview selected aggregate creatives')
+                        for s in sel:
+                            idx = int(s.split(' — ')[0])
+                            row = agg_df.iloc[idx]
+                            st.markdown(f"**{row['Subject']}** — *{row['Date']}*  \nAccounts: {row['Accounts_Present']}")
+                            # Render preview full-width (not side-by-side)
+                            if row['HTML'] and row['HTML'] != '-':
+                                components.html(row['HTML'], height=480, scrolling=True)
+                                st.markdown('**Copy HTML**')
+                                components.html(copy_button_html(row['HTML'], key=row['Signature']), height=60)
+                            else:
+                                st.write('No HTML available for this creative')
                             st.markdown('---')
+                else:
+                    st.info('No aggregate rows to show')
 
-                    st.success("Table populated. Use the selector above to preview creatives.")
+                # ---------- SHOW PER-ACCOUNT RAW TABLE (full-width, spaced) ----------
+                st.markdown('## Per-account Raw Messages')
+                st.write('This table lists the captured messages per account (UID, Subject, Display, Date, Has HTML).')
+                raw_display = raw_df[['Account','UID','Subject','Display','Date','HTML']].copy()
+                raw_display['Has HTML?'] = raw_display['HTML'].apply(lambda x: bool(x and x != '-'))
+                raw_display = raw_display[['Account','UID','Subject','Display','Date','Has HTML?']]
+                st.dataframe(raw_display.reset_index(drop=True), use_container_width=True)
 
-st.markdown("---")
-st.caption("Table shows the key fields. Select rows to render previews. If you want the table downloadable as CSV or an export of HTML creatives as ZIP, I can add those next.")
+                st.success('Finished — aggregate and per-account tables are above.')
+
+# small note about how the "same creative in different accounts" is determined
+st.markdown('---')
+st.caption('How "same creative" is determined: we group messages by the SHA-256 signature of (Subject + Display + HTML). If these three match exactly across accounts, they are considered the same creative and shown as a single aggregate row with Accounts listing.')
