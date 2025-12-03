@@ -1,6 +1,5 @@
-# app.py - Inbox Creative Fetcher (Full working code)
-# Streamlit app: fetch Subject, Display snippet, and HTML creative by From-domain (last N days)
-# Requirements: streamlit, pandas, pytz (pip install streamlit pandas pytz)
+# app.py - Inbox Creative Fetcher (table + selectable previews)
+# Run: streamlit run app.py
 
 import streamlit as st
 import imaplib
@@ -17,15 +16,15 @@ import uuid
 import streamlit.components.v1 as components
 
 # ---------- Page ----------
-st.set_page_config(page_title="Inbox Creative Fetcher", layout="wide")
-st.title("📥 Fetch Subject / Display Snippet / HTML Preview by Domain")
+st.set_page_config(page_title="Inbox Creative Fetcher — Table", layout="wide")
+st.title("📥 Fetch Subject / Display Snippet / HTML (Structured Table + Preview)")
 
 # ---------- Config ----------
-UID_SCAN_LIMIT = 2000      # how many recent UIDs to scan when using SINCE
+UID_SCAN_LIMIT = 2000
 DEFAULT_DAYS = 30
 DEFAULT_MAX_MESSAGES = 200
 
-# ---------- Helper utilities ----------
+# ---------- Helpers ----------
 def decode_mime_words(s):
     if not s: return ""
     decoded = ''
@@ -60,7 +59,6 @@ def try_decode_payload(part):
     except Exception:
         charset = None
     text = safe_decode_bytes(payload, charset)
-    # attempt to clean quoted-printable remnants
     try:
         text = quopri.decodestring(text.encode('utf-8', errors='ignore')).decode('utf-8', errors='ignore')
     except Exception:
@@ -69,7 +67,6 @@ def try_decode_payload(part):
 
 def strip_html_tags(html_text):
     if not html_text: return ''
-    # remove scripts/styles (just in case) and tags, unescape entities
     html_text = re.sub(r'(?is)<(script|style).*?>.*?</\1>', ' ', html_text)
     text = re.sub(r'<[^>]+>', ' ', html_text)
     text = html.unescape(text)
@@ -77,11 +74,6 @@ def strip_html_tags(html_text):
     return text
 
 def extract_subject_display_html_from_msg(msg):
-    """
-    Returns (subject, display_snippet, html_creative_or_dash)
-    - display_snippet prefers text/plain (first ~3 lines) otherwise derives from stripped HTML
-    - html_creative is decoded HTML string or '-' if none
-    """
     subject = decode_mime_words(msg.get('Subject','No Subject'))
     found_html = None
     found_plain = None
@@ -120,7 +112,6 @@ def extract_subject_display_html_from_msg(msg):
         return subject, display, '-'
 
 def copy_button_html(text, key=None):
-    """Return a small HTML snippet with a copy-to-clipboard button using the full HTML text."""
     if key is None:
         key = str(uuid.uuid4())
     safe_text = html.escape(text)
@@ -142,13 +133,8 @@ def copy_button_html(text, key=None):
     """
     return snippet
 
-# ---------- IMAP fetch function ----------
+# ---------- IMAP fetch ----------
 def fetch_subject_display_html_by_domain(email_addr, password, domain, days_window=DEFAULT_DAYS, max_messages=DEFAULT_MAX_MESSAGES, uid_scan_limit=UID_SCAN_LIMIT):
-    """
-    Connect to Gmail IMAP, search messages SINCE cutoff (days_window), filter by domain in From,
-    fetch the full body for matched messages, and return DataFrame with columns:
-    UID, Subject, Display, HTML, Date
-    """
     results = []
     try:
         imap = imaplib.IMAP4_SSL('imap.gmail.com')
@@ -169,11 +155,8 @@ def fetch_subject_display_html_by_domain(email_addr, password, domain, days_wind
             imap.logout()
             return pd.DataFrame(results)
 
-        # Limit how many UIDs we check to avoid huge mailboxes
         uids_to_check = all_uids[-uid_scan_limit:] if len(all_uids) > uid_scan_limit else all_uids
-
         count = 0
-        # iterate newest-first so max_messages fills quickly
         for i in range(len(uids_to_check)-1, -1, -1):
             if count >= max_messages:
                 break
@@ -192,11 +175,9 @@ def fetch_subject_display_html_by_domain(email_addr, password, domain, days_wind
                     continue
                 msg_hdr = email.message_from_bytes(hdr_part)
                 from_h = decode_mime_words(msg_hdr.get('From',''))
-                # filter by domain substring in From header
                 if domain.lower() not in from_h.lower():
                     continue
 
-                # fetch the full body (we need HTML)
                 r2, md2 = imap.uid('fetch', uid_str, '(BODY.PEEK[])')
                 if r2 != 'OK' or not md2:
                     continue
@@ -207,7 +188,6 @@ def fetch_subject_display_html_by_domain(email_addr, password, domain, days_wind
                         break
                 if not raw_msg_bytes:
                     continue
-
                 try:
                     msg = email.message_from_bytes(raw_msg_bytes)
                 except Exception:
@@ -218,7 +198,6 @@ def fetch_subject_display_html_by_domain(email_addr, password, domain, days_wind
                 raw_date = msg.get('Date','')
                 formatted_date = raw_date
                 try:
-                    # format to IST readable
                     formatted_date = parsedate_to_datetime(raw_date).astimezone(pytz.timezone('Asia/Kolkata')).strftime('%d-%b-%Y %I:%M %p')
                 except Exception:
                     formatted_date = raw_date
@@ -227,12 +206,12 @@ def fetch_subject_display_html_by_domain(email_addr, password, domain, days_wind
                     'UID': uid_str,
                     'Subject': subject,
                     'Display': display,
-                    'HTML': html_creative,
-                    'Date': formatted_date
+                    'Has_HTML': bool(html_creative and html_creative != '-'),
+                    'Date': formatted_date,
+                    'HTML': html_creative
                 })
                 count += 1
             except Exception:
-                # ignore per-message errors, continue
                 continue
 
         imap.logout()
@@ -255,19 +234,18 @@ with col2:
 with col3:
     max_msgs = st.number_input('Max messages', min_value=1, max_value=2000, value=DEFAULT_MAX_MESSAGES, step=1)
 
-st.info("Provide a Gmail account (App Password recommended) — the app searches the chosen inbox for messages whose From header contains the domain you supply.")
+st.info("Provide a Gmail account (App Password recommended). The app searches the chosen inbox for messages whose From header contains the domain you supply.")
 
-# credentials editor (small)
+# credentials editor
 if 'creds_df' not in st.session_state:
     st.session_state.creds_df = pd.DataFrame([{'Email':'','Password':''}])
-
 colc1, colc2 = st.columns([3,1])
 with colc1:
     edited = st.data_editor(st.session_state.creds_df, num_rows='dynamic', use_container_width=True, hide_index=True)
     st.session_state.creds_df = edited
 
 with colc2:
-    if st.button('Fetch & Preview'):
+    if st.button('Fetch & Show Table'):
         creds = [r for _,r in st.session_state.creds_df.iterrows() if r.get('Email','').strip() and r.get('Password','').strip()]
         if not creds:
             st.error('Please provide at least one account with app password.')
@@ -275,42 +253,51 @@ with colc2:
             st.error('Provide a domain to filter by (e.g. example.com)')
         else:
             acct = creds[0]
-            with st.spinner('Fetching and rendering previews — beware large mailboxes...'):
+            with st.spinner('Fetching messages...'):
                 df = fetch_subject_display_html_by_domain(acct['Email'], acct['Password'], domain_input.strip(), days_window=days, max_messages=max_msgs)
                 if df.empty:
                     st.info('No matching messages found in the date window.')
                 else:
-                    st.subheader(f'Results — {len(df)} message(s)')
-                    # present compact rows: Subject | Display | Rendered preview | Copy HTML
-                    for idx, row in df.iterrows():
-                        subj = row['Subject']
-                        disp = row['Display']
-                        html_code = row['HTML']
-                        date_str = row.get('Date','-')
+                    # Well-structured table (UID, Subject, Display, Date, Has_HTML)
+                    display_df = df[['UID','Subject','Display','Date','Has_HTML']].copy()
+                    display_df = display_df.rename(columns={'Has_HTML':'Has HTML?'})
+                    display_df.index = range(1, len(display_df)+1)  # friendly 1-based index
+                    st.subheader(f'Results — {len(display_df)} message(s)')
+                    st.dataframe(display_df, use_container_width=True)
 
-                        st.markdown(f"**{subj}**  ")
-                        st.markdown(f"*{date_str}* — {disp}")
-                        cols = st.columns([1.2,1,0.8])
-                        with cols[0]:
-                            st.write("Preview (rendered)")
-                            if html_code and html_code != '-':
-                                # Render HTML — looks like browser. Be aware remote images/resources may load.
-                                # Height chosen to display content; adjust if needed.
-                                components.html(html_code, height=400, scrolling=True)
-                            else:
-                                st.write("No HTML creative available")
-                        with cols[1]:
-                            st.write("HTML (trimmed)")
-                            truncated = (html_code[:800] + '...') if html_code and len(html_code) > 800 else html_code
-                            st.text_area(f'html_{idx}', value=truncated if truncated else '-', height=160)
-                        with cols[2]:
-                            st.write("Copy")
-                            if html_code and html_code != '-':
-                                components.html(copy_button_html(html_code, key=row['UID']), height=60)
-                            else:
-                                st.write("—")
-                        st.markdown("---")
-                    st.success("Done fetching previews.")
+                    # Provide multi-select to preview rows from the table
+                    options = [f"{row.UID} — {row.Subject} — {row.Date}" for _, row in df.iterrows()]
+                    uid_map = {f"{row.UID} — {row.Subject} — {row.Date}": row.UID for _, row in df.iterrows()}
+                    selected = st.multiselect("Select messages to preview (multiple allowed)", options=options)
+
+                    if selected:
+                        st.button("Preview selected")  # visual affordance; previews render below automatically
+                        st.markdown("### Preview(s)")
+                        for sel in selected:
+                            uid = uid_map.get(sel)
+                            row = df[df['UID'] == uid].iloc[0]
+                            st.markdown(f"**{row['Subject']}** — *{row['Date']}*")
+                            cols = st.columns([1.2,1,0.8])
+                            with cols[0]:
+                                st.write("Preview (rendered)")
+                                html_code = row['HTML']
+                                if html_code and html_code != '-':
+                                    components.html(html_code, height=400, scrolling=True)
+                                else:
+                                    st.write("No HTML available")
+                            with cols[1]:
+                                st.write("HTML (trimmed)")
+                                truncated = (row['HTML'][:800] + '...') if row['HTML'] and len(row['HTML']) > 800 else row['HTML']
+                                st.text_area(f'html_preview_{uid}', value=truncated if truncated else '-', height=160)
+                            with cols[2]:
+                                st.write("Copy")
+                                if row['HTML'] and row['HTML'] != '-':
+                                    components.html(copy_button_html(row['HTML'], key=uid), height=60)
+                                else:
+                                    st.write("—")
+                            st.markdown('---')
+
+                    st.success("Table populated. Use the selector above to preview creatives.")
 
 st.markdown("---")
-st.caption("Notes: This renders raw HTML from emails. If your creatives include remote images/resources they'll attempt to load in the preview. Increase `Max messages` or `Days window` carefully for large mailboxes.")
+st.caption("Table shows the key fields. Select rows to render previews. If you want the table downloadable as CSV or an export of HTML creatives as ZIP, I can add those next.")
