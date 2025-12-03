@@ -1,5 +1,5 @@
 # app.py
-# Inbox Creative Fetcher — Sub-ID consensus + Preview-first UI
+# Inbox Creative Fetcher — Sub-ID boxes with Preview + From + Subject + Copy
 # Run: streamlit run app.py
 # Requires: streamlit, pandas, pytz
 
@@ -18,16 +18,17 @@ import uuid
 import hashlib
 import streamlit.components.v1 as components
 import base64
+import json
 
-st.set_page_config(page_title="Inbox Creative Fetcher — SubIDs + Previews", layout="wide")
-st.title("📥 Inbox Creative Fetcher — Sub-ID Consensus + Preview UI")
+st.set_page_config(page_title="Inbox Creative Fetcher — SubID Previews", layout="wide")
+st.title("📥 Inbox Creative Fetcher — Sub-ID Boxes + Previews")
 
 # ---------- Config ----------
 UID_SCAN_LIMIT = 2000
 DEFAULT_MAX_MESSAGES = 20
 BATCH_FETCH_SIZE = 100
 
-# ---------- Sub-ID helpers (from your original) ----------
+# ---------- Sub-ID helpers ----------
 ID_RE = re.compile(r'\b(GRM-[A-Za-z0-9\-]+|GMFP-[A-Za-z0-9\-]+|GTC-[A-Za-z0-9\-]+|GRTC-[A-Za-z0-9\-]+)\b', re.I)
 
 def map_id_to_type(sub_id):
@@ -78,7 +79,7 @@ def format_date_to_ist_string(raw_date):
     return formatted, dt_ist_naive
 
 def extract_subid_from_msg(msg):
-    # try Message-ID and headers and body and base64 tokens
+    # message-id
     msg_id_raw = decode_mime_words(msg.get("Message-ID", "") or msg.get("Message-Id", "") or "")
     if msg_id_raw:
         tokens = re.split(r'[_\s]+', msg_id_raw)
@@ -217,6 +218,7 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
         imap.login(email_addr.strip(), password.strip())
         imap.select('inbox')
 
+        # do a targeted server-side search if domain_substring provided
         if domain_substring:
             try:
                 status, data = imap.uid('search', None, 'FROM', f'"{domain_substring}"')
@@ -243,7 +245,7 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
             try:
                 res, md = imap.uid('fetch', uid_seq, '(BODY.PEEK[])')
             except Exception:
-                # fallback to per uid
+                # fallback per-UID
                 for u in chunk:
                     try:
                         u_str = u.decode()
@@ -258,13 +260,17 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
                         if not raw_msg_bytes:
                             continue
                         msg = email.message_from_bytes(raw_msg_bytes)
+                        # extract header 'From' from the header fetch if available
                         subject, display, html_creative = extract_subject_display_html_from_msg(msg)
+                        # attempt to read 'From' header from msg (if not present, fallback to '-')
+                        from_h = decode_mime_words(msg.get('From','-'))
                         sub_id, sid_type = extract_subid_from_msg(msg)
                         raw_date = msg.get('Date','')
                         formatted_date, dt = format_date_to_ist_string(raw_date)
                         rows.append({
                             'Account': email_addr,
                             'UID': u_str,
+                            'From': from_h,
                             'Subject': subject,
                             'Display': display,
                             'HTML': html_creative,
@@ -277,7 +283,6 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
                         continue
                 continue
 
-            # parse batch response
             for part in md:
                 if not isinstance(part, tuple):
                     continue
@@ -299,12 +304,14 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
                     uid_found = None
                 uid_val = uid_found if uid_found else (chunk[0].decode() if chunk else '')
                 subject, display, html_creative = extract_subject_display_html_from_msg(msg)
+                from_h = decode_mime_words(msg.get('From','-'))
                 sub_id, sid_type = extract_subid_from_msg(msg)
                 raw_date = msg.get('Date','')
                 formatted_date, dt = format_date_to_ist_string(raw_date)
                 rows.append({
                     'Account': email_addr,
                     'UID': uid_val,
+                    'From': from_h,
                     'Subject': subject,
                     'Display': display,
                     'HTML': html_creative,
@@ -324,32 +331,32 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
 
     return rows
 
-# ---------- Preview box HTML (copy button) ----------
-def preview_box_html(html_content, preview_id, copy_btn_id):
-    html_js = html_module.escape(html_content or '')
-    # We use JSON dumps for JS variables where needed; here we inject escaped HTML inside innerHTML as text
-    safe_html = html_module.escape(html_content or '')
+# ---------- Preview box generator ----------
+def preview_box_html_and_copy(html_content, copy_btn_id):
+    # We will render the HTML literally inside the preview container, and provide a copy button that writes the exact HTML to clipboard.
+    html_js = json.dumps(html_content or "")
+    safe_preview = html_module.escape(html_content or "")
     return f"""
     <div style='border:1px solid #e6e6e6; border-radius:8px; padding:8px; background:#fff;'>
       <div style='display:flex; justify-content:flex-end; margin-bottom:6px;'>
-        <button id='{copy_btn_id}' style='padding:6px 8px;'>Copy</button>
+        <button id='{copy_btn_id}' style='padding:6px 8px;'>Copy HTML</button>
       </div>
-      <div id='{preview_id}' style='min-height:60px; max-height:220px; overflow:auto; border:1px solid #f2f2f2; padding:6px; background:#fbfbfb;'>
-        {safe_html}
+      <div style='min-height:60px; max-height:240px; overflow:auto; border:1px solid #f2f2f2; padding:6px; background:#fbfbfb;'>
+        {safe_preview}
       </div>
       <script>
         (function(){{
           const btn = document.getElementById('{copy_btn_id}');
-          const htmlSource = `{html_js}`;
-          btn.onclick = function(){{ navigator.clipboard.writeText(htmlSource).then(()=>{{ btn.innerText='Copied'; setTimeout(()=>{{ btn.innerText='Copy'; }},1200); }}); }};
+          const htmlSource = {html_js};
+          btn.onclick = function(){{ navigator.clipboard.writeText(htmlSource).then(()=>{{ btn.innerText='Copied'; setTimeout(()=>{{ btn.innerText='Copy HTML'; }},1200); }}); }};
         }})();
       </script>
     </div>
     """
 
 # ---------- UI ----------
-st.markdown("### 🔎 Input")
-st.info("Add accounts (Email + App Password). Optionally provide a domain substring for server-side FROM search (fast).")
+st.markdown("### 🔎 Input — Fetch last N messages per account")
+st.info("Add accounts (Email + App Password). Optionally provide a domain substring to let IMAP server filter messages (faster).")
 
 if 'creds_df' not in st.session_state:
     st.session_state.creds_df = pd.DataFrame([{'Email':'','Password':''}])
@@ -357,13 +364,11 @@ if 'creds_df' not in st.session_state:
 edited = st.data_editor(st.session_state.creds_df, num_rows='dynamic', use_container_width=True, hide_index=True)
 st.session_state.creds_df = edited
 
-col1, col2, col3 = st.columns([2,1,1])
+col1, col2 = st.columns([2,1])
 with col1:
     domain_input = st.text_input('Domain substring to filter FROM header (optional)', value='')
 with col2:
     max_msgs = st.number_input('Max messages per account', min_value=1, max_value=2000, value=DEFAULT_MAX_MESSAGES, step=1)
-with col3:
-    required_accounts_count = st.number_input('Require Sub-ID in at least N accounts', min_value=1, max_value=10, value=2, step=1)
 
 if st.button('Fetch across accounts'):
     creds = [r for _, r in st.session_state.creds_df.iterrows() if r.get('Email','').strip() and r.get('Password','').strip()]
@@ -386,125 +391,64 @@ if st.button('Fetch across accounts'):
         else:
             df = pd.DataFrame(all_rows)
 
-            # ---------- SUB-ID CONSENSUS (top) ----------
-            st.subheader(f"🔎 Sub-ID Consensus (≥ {required_accounts_count} accounts)")
-            # Build asset map keyed by (Subject, Display, HTML) to collect subids and accounts per asset
-            asset_map = {}  # key -> {"accounts":set(), "subids":set(), "rows":[...]}
+            # ---------- SUB-ID BOXES (no threshold) ----------
+            st.subheader("🔎 Sub-IDs (every match shown)")
+            # Build asset map keyed by Sub-ID (we want one box per Sub-ID)
+            subid_map = {}  # subid -> {"accounts":set(),"examples":[rows], "htmls": set(), "latest_date":...}
             for _, row in df.iterrows():
-                key = (row.get('Subject','-'), row.get('Display','-'), row.get('HTML','-'))
-                asset = asset_map.setdefault(key, {"accounts": set(), "subids": set(), "rows": []})
-                asset["accounts"].add(row['Account'])
-                sid = row.get('Sub ID', '-') or '-'
-                if sid and sid != "-":
-                    asset["subids"].add(sid)
-                asset["rows"].append({
-                    "account": row['Account'],
-                    "UID": row.get('UID'),
-                    "Date": row.get('Date'),
-                    "Date_dt": row.get('Date_dt'),
-                    "Sub ID": sid,
-                    "Type": row.get('Type', '-'),
-                    "HTML": row.get('HTML'),
-                })
-
-            subid_rows = []
-            for (subject, display, htmlc), info in asset_map.items():
-                # asset must be present in >= required_accounts_count accounts to be considered
-                if len(info["accounts"]) < required_accounts_count:
+                sid = row.get('Sub ID') or "-"
+                if sid == "-" or sid is None:
                     continue
-                for subid in sorted(list(info["subids"])):
-                    # check which accounts have this specific subid for this asset
-                    subid_rows_for_asset = [r for r in info["rows"] if (r.get("Sub ID") or "-") == subid]
-                    subid_accounts = {r["account"] for r in subid_rows_for_asset}
-                    if len(subid_accounts) < required_accounts_count:
-                        continue
-                    # find latest time among rows for this subid
-                    latest_dt = None
-                    latest_str = "-"
-                    for r in subid_rows_for_asset:
-                        dt = r.get("Date_dt")
-                        if dt is not None and (latest_dt is None or dt > latest_dt):
-                            latest_dt = dt
-                            latest_str = r.get("Date") or latest_str
-                    subid_rows.append({
-                        "Sub ID": subid,
-                        "Type": map_id_to_type(subid),
-                        "Time (IST)": latest_str,
-                        "Accounts": ', '.join(sorted(subid_accounts)),
-                        "Subject": subject,
-                        "Display": display
+                entry = subid_map.setdefault(sid, {"accounts": set(), "examples": [], "htmls": set(), "latest_dt": None})
+                entry["accounts"].add(row['Account'])
+                entry["examples"].append(row)
+                if row.get('HTML'):
+                    entry["htmls"].add(row.get('HTML'))
+                dt = row.get('Date_dt')
+                if dt is not None and (entry["latest_dt"] is None or dt > entry["latest_dt"]):
+                    entry["latest_dt"] = dt
+
+            if not subid_map:
+                st.info("No Sub-IDs found in the fetched messages.")
+            else:
+                # render boxes: grid of 2 columns
+                sub_entries = []
+                # sort subids by latest_dt desc (newest first)
+                for sid, v in sorted(subid_map.items(), key=lambda x: (x[1]['latest_dt'] is None, x[1]['latest_dt']), reverse=True):
+                    # choose representative Subject/From/Display from examples (use newest example)
+                    ex = sorted(v['examples'], key=lambda r: (r.get('Date_dt') is None, r.get('Date_dt')), reverse=True)[0]
+                    # If multiple HTMLs exist for same Sub-ID, concatenate with separator so copy gets all variants
+                    html_joined = "\n\n<!-- === HTML variant separator === -->\n\n".join(list(v['htmls'])) if v['htmls'] else (ex.get('HTML') or '')
+                    sub_entries.append({
+                        'subid': sid,
+                        'type': ex.get('Type', '-'),
+                        'from': ex.get('From','-'),
+                        'subject': ex.get('Subject','-'),
+                        'display': ex.get('Display','-'),
+                        'accounts_count': len(v['accounts']),
+                        'accounts_list': ', '.join(sorted(v['accounts'])),
+                        'html': html_joined
                     })
-            if subid_rows:
-                subid_df = pd.DataFrame(subid_rows)
-                # sort by latest time desc where possible
-                def sort_key(r):
-                    t = r.get("Time (IST)")
-                    try:
-                        return parsedate_to_datetime(t)
-                    except Exception:
-                        return datetime.datetime.min
-                # show concise columns
-                display_cols = ["Sub ID","Type","Time (IST)","Accounts","Subject","Display"]
-                st.dataframe(subid_df.reindex(columns=display_cols), use_container_width=True)
-            else:
-                st.info(f"No Sub-IDs found that meet the threshold of {required_accounts_count} accounts.")
 
-            st.markdown("---")
-
-            # ---------- PREVIEWS (no central table) ----------
-            st.subheader("Previews — unique creatives (Subject + Display + HTML)")
-            # Aggregate creatives by signature (exact)
-            agg = {}
-            # keep an ordered list so previews are deterministic (newest-first by Date_dt)
-            df_sorted = df.sort_values(by=['Date_dt'], ascending=False, na_position='last')
-            for _, r in df_sorted.iterrows():
-                sig = make_signature(r['Subject'], r['Display'], r['HTML'])
-                if sig not in agg:
-                    agg[sig] = {
-                        'Subject': r['Subject'],
-                        'Display': r['Display'],
-                        'HTML': r['HTML'] or '',
-                        'Accounts': set([r['Account']]),
-                        'Dates': [r['Date_dt']] if r.get('Date_dt') is not None else []
-                    }
-                else:
-                    agg[sig]['Accounts'].add(r['Account'])
-                    if r.get('Date_dt') is not None:
-                        agg[sig]['Dates'].append(r['Date_dt'])
-
-            entries = []
-            for sig, v in agg.items():
-                entries.append({
-                    'signature': sig,
-                    'subject': v['Subject'],
-                    'display': v['Display'],
-                    'html': v['HTML'],
-                    'accounts_count': len(v['Accounts']),
-                    'accounts_list': ', '.join(sorted(v['Accounts']))
-                })
-
-            if not entries:
-                st.info("No creatives to preview.")
-            else:
-                # Render previews grid (2 columns)
                 cols_per_row = 2
-                for row_start in range(0, len(entries), cols_per_row):
+                for row_start in range(0, len(sub_entries), cols_per_row):
                     cols = st.columns(cols_per_row)
                     for j in range(cols_per_row):
                         idx = row_start + j
-                        if idx >= len(entries):
+                        if idx >= len(sub_entries):
                             continue
-                        e = entries[idx]
-                        preview_id = f"preview_{idx}_{uuid.uuid4().hex[:6]}"
-                        copy_btn_id = f"copy_{idx}_{uuid.uuid4().hex[:6]}"
-                        box_html = preview_box_html(e['html'], preview_id, copy_btn_id)
+                        e = sub_entries[idx]
+                        copy_btn_id = f"sub_copy_{idx}_{uuid.uuid4().hex[:6]}"
+                        # Build preview box with copy and HTML render
+                        box_html = preview_box_html_and_copy(e['html'], copy_btn_id)
                         with cols[j]:
-                            components.html(box_html, height=220, scrolling=True)
-                            # Below preview show subject, display, accounts
-                            st.markdown(f"**Subject:** {e['subject'] or '-'}  \n**Display:** {e['display'] or '-'}")
-                            st.markdown(f"**Accounts ({e['accounts_count']}):** {e['accounts_list']}")
-                            st.markdown("---")
+                            st.markdown(f"**Sub-ID:** {e['subid']} — **Type:** {e['type']}")
+                            components.html(box_html, height=260, scrolling=True)
+                            st.markdown(f"**From:** {html_module.escape(e['from'])}  \n**Subject:** {html_module.escape(e['subject'])}  \n**Display:** {html_module.escape(e['display'])}")
+                            st.markdown(f"**Accounts ({e['accounts_count']}):** {html_module.escape(e['accounts_list'])}")
+                            st.markdown('---')
 
-            st.success("Done — Sub-ID table above, previews below. Use Copy buttons in preview boxes to copy full HTML.")
-st.markdown("---")
-st.caption("Notes: Sub-IDs are found by scanning Message-ID, headers and message body (including trying base64/urlsafe base64 tokens). Creatives are grouped by exact match of (Subject + Display + HTML).")
+            st.success("Done — Sub-ID boxes rendered. Use Copy HTML in each box to copy the full HTML (all variants concatenated if multiple).")
+
+st.markdown('---')
+st.caption('Notes: Sub-IDs are extracted from Message-ID, headers and body (including trying base64 variations). Each Sub-ID box shows a preview and a Copy HTML button; the copy copies all HTML variants found for that Sub-ID (joined with a separator).')
