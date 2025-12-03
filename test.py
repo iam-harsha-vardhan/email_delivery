@@ -1,7 +1,7 @@
 # app.py
-# Inbox Creative Fetcher — Single Table + Preview column (full HTML in table + easy copy)
+# Inbox Creative Fetcher — Sub-ID consensus + Preview-first UI
 # Run: streamlit run app.py
-# Requirements: streamlit, pandas, pytz
+# Requires: streamlit, pandas, pytz
 
 import streamlit as st
 import imaplib
@@ -17,17 +17,105 @@ import html as html_module
 import uuid
 import hashlib
 import streamlit.components.v1 as components
-import json
+import base64
 
-st.set_page_config(page_title="Inbox Creative Fetcher — Single Table + Previews", layout="wide")
-st.title("📥 Inbox Creative Fetcher — Table (Full HTML) + Previews")
+st.set_page_config(page_title="Inbox Creative Fetcher — SubIDs + Previews", layout="wide")
+st.title("📥 Inbox Creative Fetcher — Sub-ID Consensus + Preview UI")
 
 # ---------- Config ----------
 UID_SCAN_LIMIT = 2000
 DEFAULT_MAX_MESSAGES = 20
 BATCH_FETCH_SIZE = 100
 
-# ---------- Helpers ----------
+# ---------- Sub-ID helpers (from your original) ----------
+ID_RE = re.compile(r'\b(GRM-[A-Za-z0-9\-]+|GMFP-[A-Za-z0-9\-]+|GTC-[A-Za-z0-9\-]+|GRTC-[A-Za-z0-9\-]+)\b', re.I)
+
+def map_id_to_type(sub_id):
+    if not sub_id: return "-"
+    lid = sub_id.lower()
+    if lid.startswith('grm'): return 'FPR'
+    if lid.startswith('gmfp'): return 'FP'
+    if lid.startswith('gtc'): return 'FPTC'
+    if lid.startswith('grtc'): return 'FPRTC'
+    return "-"
+
+def try_base64_variants(s):
+    if not s or len(s) < 4: return None
+    s = s.strip()
+    if s.startswith('<') and s.endswith('>'): s = s[1:-1]
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        for pad in range(0,4):
+            try:
+                cand = s + ('=' * pad)
+                decoded = decoder(cand)
+                try:
+                    text = decoded.decode('utf-8', errors='ignore')
+                except Exception:
+                    continue
+                if text and text.strip():
+                    return text
+            except Exception:
+                continue
+    return None
+
+def find_subid_in_text(txt):
+    if not txt: return None
+    m = ID_RE.search(txt)
+    return m.group(1) if m else None
+
+def format_date_to_ist_string(raw_date):
+    if not raw_date: return "-", None
+    try:
+        dt = parsedate_to_datetime(raw_date)
+    except Exception:
+        return raw_date, None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    ist = pytz.timezone("Asia/Kolkata")
+    dt_ist = dt.astimezone(ist)
+    dt_ist_naive = dt_ist.replace(tzinfo=None)
+    formatted = dt_ist.strftime("%d-%b-%Y %I:%M %p")
+    return formatted, dt_ist_naive
+
+def extract_subid_from_msg(msg):
+    # try Message-ID and headers and body and base64 tokens
+    msg_id_raw = decode_mime_words(msg.get("Message-ID", "") or msg.get("Message-Id", "") or "")
+    if msg_id_raw:
+        tokens = re.split(r'[_\s]+', msg_id_raw)
+        for t in tokens:
+            maybe = find_subid_in_text(t)
+            if maybe: return maybe, map_id_to_type(maybe)
+            decoded = try_base64_variants(t)
+            if decoded:
+                m2 = find_subid_in_text(decoded)
+                if m2: return m2, map_id_to_type(m2)
+    headers_str = " ".join(f"{h}:{v}" for h,v in msg.items())
+    maybe = find_subid_in_text(headers_str)
+    if maybe: return maybe, map_id_to_type(maybe)
+    try:
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            if ctype in ("text/plain","text/html"):
+                payload = part.get_payload(decode=True)
+                if not payload: continue
+                try:
+                    text = payload.decode(part.get_content_charset() or 'utf-8', errors='ignore')
+                except Exception:
+                    text = str(payload)
+                maybe = find_subid_in_text(text)
+                if maybe: return maybe, map_id_to_type(maybe)
+                tokens = re.split(r'[^A-Za-z0-9_\-+/=]', text)
+                for t in tokens:
+                    if len(t) < 12: continue
+                    dec = try_base64_variants(t)
+                    if dec:
+                        m2 = find_subid_in_text(dec)
+                        if m2: return m2, map_id_to_type(m2)
+    except Exception:
+        pass
+    return None, "-"
+
+# ---------- MIME / HTML extraction helpers ----------
 def decode_mime_words(s):
     if not s:
         return ""
@@ -121,7 +209,7 @@ def make_signature(subject, display, html_text):
     key = (subject or '') + '\n||\n' + (display or '') + '\n||\n' + (html_text or '')
     return hashlib.sha256(key.encode('utf-8')).hexdigest()
 
-# ---------- Fast IMAP fetch (server-side search when possible) ----------
+# ---------- IMAP fast fetch (server-side FROM search when provided) ----------
 def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_messages=DEFAULT_MAX_MESSAGES, uid_scan_limit=UID_SCAN_LIMIT):
     rows = []
     try:
@@ -149,14 +237,13 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
         candidate_uids = matched_uids[-uid_scan_limit:] if len(matched_uids) > uid_scan_limit else matched_uids
         selected_uids = candidate_uids[-int(max_messages):] if len(candidate_uids) > int(max_messages) else candidate_uids
 
-        # fetch in batches
         for i in range(0, len(selected_uids), BATCH_FETCH_SIZE):
             chunk = selected_uids[i:i+BATCH_FETCH_SIZE]
             uid_seq = b','.join(chunk)
             try:
                 res, md = imap.uid('fetch', uid_seq, '(BODY.PEEK[])')
             except Exception:
-                # fallback per-UID
+                # fallback to per uid
                 for u in chunk:
                     try:
                         u_str = u.decode()
@@ -172,17 +259,25 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
                             continue
                         msg = email.message_from_bytes(raw_msg_bytes)
                         subject, display, html_creative = extract_subject_display_html_from_msg(msg)
+                        sub_id, sid_type = extract_subid_from_msg(msg)
                         raw_date = msg.get('Date','')
-                        try:
-                            formatted_date = parsedate_to_datetime(raw_date).astimezone(pytz.timezone('Asia/Kolkata')).strftime('%d-%b-%Y %I:%M %p')
-                        except Exception:
-                            formatted_date = raw_date
-                        rows.append({'Account': email_addr, 'UID': u_str, 'Subject': subject, 'Display': display, 'HTML': html_creative, 'Date': formatted_date})
+                        formatted_date, dt = format_date_to_ist_string(raw_date)
+                        rows.append({
+                            'Account': email_addr,
+                            'UID': u_str,
+                            'Subject': subject,
+                            'Display': display,
+                            'HTML': html_creative,
+                            'Date': formatted_date,
+                            'Date_dt': dt,
+                            'Sub ID': sub_id or "-",
+                            'Type': sid_type
+                        })
                     except Exception:
                         continue
                 continue
 
-            # parse returned tuples
+            # parse batch response
             for part in md:
                 if not isinstance(part, tuple):
                     continue
@@ -193,7 +288,7 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
                     msg = email.message_from_bytes(raw_msg_bytes)
                 except Exception:
                     continue
-                # extract uid if present in meta
+                # try to get UID from meta
                 uid_found = None
                 try:
                     meta = part[0].decode('utf-8', errors='ignore')
@@ -204,12 +299,20 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
                     uid_found = None
                 uid_val = uid_found if uid_found else (chunk[0].decode() if chunk else '')
                 subject, display, html_creative = extract_subject_display_html_from_msg(msg)
+                sub_id, sid_type = extract_subid_from_msg(msg)
                 raw_date = msg.get('Date','')
-                try:
-                    formatted_date = parsedate_to_datetime(raw_date).astimezone(pytz.timezone('Asia/Kolkata')).strftime('%d-%b-%Y %I:%M %p')
-                except Exception:
-                    formatted_date = raw_date
-                rows.append({'Account': email_addr, 'UID': uid_val, 'Subject': subject, 'Display': display, 'HTML': html_creative, 'Date': formatted_date})
+                formatted_date, dt = format_date_to_ist_string(raw_date)
+                rows.append({
+                    'Account': email_addr,
+                    'UID': uid_val,
+                    'Subject': subject,
+                    'Display': display,
+                    'HTML': html_creative,
+                    'Date': formatted_date,
+                    'Date_dt': dt,
+                    'Sub ID': sub_id or "-",
+                    'Type': sid_type
+                })
 
         imap.logout()
     except imaplib.IMAP4.error as e:
@@ -221,9 +324,32 @@ def fetch_last_n_for_account_fast(email_addr, password, domain_substring, max_me
 
     return rows
 
+# ---------- Preview box HTML (copy button) ----------
+def preview_box_html(html_content, preview_id, copy_btn_id):
+    html_js = html_module.escape(html_content or '')
+    # We use JSON dumps for JS variables where needed; here we inject escaped HTML inside innerHTML as text
+    safe_html = html_module.escape(html_content or '')
+    return f"""
+    <div style='border:1px solid #e6e6e6; border-radius:8px; padding:8px; background:#fff;'>
+      <div style='display:flex; justify-content:flex-end; margin-bottom:6px;'>
+        <button id='{copy_btn_id}' style='padding:6px 8px;'>Copy</button>
+      </div>
+      <div id='{preview_id}' style='min-height:60px; max-height:220px; overflow:auto; border:1px solid #f2f2f2; padding:6px; background:#fbfbfb;'>
+        {safe_html}
+      </div>
+      <script>
+        (function(){{
+          const btn = document.getElementById('{copy_btn_id}');
+          const htmlSource = `{html_js}`;
+          btn.onclick = function(){{ navigator.clipboard.writeText(htmlSource).then(()=>{{ btn.innerText='Copied'; setTimeout(()=>{{ btn.innerText='Copy'; }},1200); }}); }};
+        }})();
+      </script>
+    </div>
+    """
+
 # ---------- UI ----------
-st.markdown("### 🔎 Input — last N messages per account (fast search)")
-st.info("Add one or more accounts (Email + App Password). Optionally provide a domain substring (server-side FROM search) to speed things up.")
+st.markdown("### 🔎 Input")
+st.info("Add accounts (Email + App Password). Optionally provide a domain substring for server-side FROM search (fast).")
 
 if 'creds_df' not in st.session_state:
     st.session_state.creds_df = pd.DataFrame([{'Email':'','Password':''}])
@@ -231,13 +357,15 @@ if 'creds_df' not in st.session_state:
 edited = st.data_editor(st.session_state.creds_df, num_rows='dynamic', use_container_width=True, hide_index=True)
 st.session_state.creds_df = edited
 
-col1, col2 = st.columns([2,1])
+col1, col2, col3 = st.columns([2,1,1])
 with col1:
     domain_input = st.text_input('Domain substring to filter FROM header (optional)', value='')
 with col2:
     max_msgs = st.number_input('Max messages per account', min_value=1, max_value=2000, value=DEFAULT_MAX_MESSAGES, step=1)
+with col3:
+    required_accounts_count = st.number_input('Require Sub-ID in at least N accounts', min_value=1, max_value=10, value=2, step=1)
 
-if st.button('Fetch across accounts (fast)'):
+if st.button('Fetch across accounts'):
     creds = [r for _, r in st.session_state.creds_df.iterrows() if r.get('Email','').strip() and r.get('Password','').strip()]
     if not creds:
         st.error('Please provide at least one account (Email + App password).')
@@ -248,7 +376,7 @@ if st.button('Fetch across accounts (fast)'):
         for i, cred in enumerate(creds):
             acct = cred['Email'].strip()
             pwd = cred['Password'].strip()
-            st.info(f'Fetching (fast) for {acct}...')
+            st.info(f'Fetching for {acct}...')
             rows = fetch_last_n_for_account_fast(acct, pwd, domain_input.strip(), max_messages=max_msgs)
             all_rows.extend(rows)
             progress.progress(int(((i+1)/total)*100))
@@ -256,134 +384,127 @@ if st.button('Fetch across accounts (fast)'):
         if not all_rows:
             st.info('No messages found for provided accounts / domain.')
         else:
-            raw_df = pd.DataFrame(all_rows)
+            df = pd.DataFrame(all_rows)
 
-            # Aggregate by exact signature
+            # ---------- SUB-ID CONSENSUS (top) ----------
+            st.subheader(f"🔎 Sub-ID Consensus (≥ {required_accounts_count} accounts)")
+            # Build asset map keyed by (Subject, Display, HTML) to collect subids and accounts per asset
+            asset_map = {}  # key -> {"accounts":set(), "subids":set(), "rows":[...]}
+            for _, row in df.iterrows():
+                key = (row.get('Subject','-'), row.get('Display','-'), row.get('HTML','-'))
+                asset = asset_map.setdefault(key, {"accounts": set(), "subids": set(), "rows": []})
+                asset["accounts"].add(row['Account'])
+                sid = row.get('Sub ID', '-') or '-'
+                if sid and sid != "-":
+                    asset["subids"].add(sid)
+                asset["rows"].append({
+                    "account": row['Account'],
+                    "UID": row.get('UID'),
+                    "Date": row.get('Date'),
+                    "Date_dt": row.get('Date_dt'),
+                    "Sub ID": sid,
+                    "Type": row.get('Type', '-'),
+                    "HTML": row.get('HTML'),
+                })
+
+            subid_rows = []
+            for (subject, display, htmlc), info in asset_map.items():
+                # asset must be present in >= required_accounts_count accounts to be considered
+                if len(info["accounts"]) < required_accounts_count:
+                    continue
+                for subid in sorted(list(info["subids"])):
+                    # check which accounts have this specific subid for this asset
+                    subid_rows_for_asset = [r for r in info["rows"] if (r.get("Sub ID") or "-") == subid]
+                    subid_accounts = {r["account"] for r in subid_rows_for_asset}
+                    if len(subid_accounts) < required_accounts_count:
+                        continue
+                    # find latest time among rows for this subid
+                    latest_dt = None
+                    latest_str = "-"
+                    for r in subid_rows_for_asset:
+                        dt = r.get("Date_dt")
+                        if dt is not None and (latest_dt is None or dt > latest_dt):
+                            latest_dt = dt
+                            latest_str = r.get("Date") or latest_str
+                    subid_rows.append({
+                        "Sub ID": subid,
+                        "Type": map_id_to_type(subid),
+                        "Time (IST)": latest_str,
+                        "Accounts": ', '.join(sorted(subid_accounts)),
+                        "Subject": subject,
+                        "Display": display
+                    })
+            if subid_rows:
+                subid_df = pd.DataFrame(subid_rows)
+                # sort by latest time desc where possible
+                def sort_key(r):
+                    t = r.get("Time (IST)")
+                    try:
+                        return parsedate_to_datetime(t)
+                    except Exception:
+                        return datetime.datetime.min
+                # show concise columns
+                display_cols = ["Sub ID","Type","Time (IST)","Accounts","Subject","Display"]
+                st.dataframe(subid_df.reindex(columns=display_cols), use_container_width=True)
+            else:
+                st.info(f"No Sub-IDs found that meet the threshold of {required_accounts_count} accounts.")
+
+            st.markdown("---")
+
+            # ---------- PREVIEWS (no central table) ----------
+            st.subheader("Previews — unique creatives (Subject + Display + HTML)")
+            # Aggregate creatives by signature (exact)
             agg = {}
-            for _, r in raw_df.iterrows():
+            # keep an ordered list so previews are deterministic (newest-first by Date_dt)
+            df_sorted = df.sort_values(by=['Date_dt'], ascending=False, na_position='last')
+            for _, r in df_sorted.iterrows():
                 sig = make_signature(r['Subject'], r['Display'], r['HTML'])
                 if sig not in agg:
                     agg[sig] = {
                         'Subject': r['Subject'],
                         'Display': r['Display'],
-                        'HTML': r['HTML'],
-                        'Accounts': set([r['Account']])
+                        'HTML': r['HTML'] or '',
+                        'Accounts': set([r['Account']]),
+                        'Dates': [r['Date_dt']] if r.get('Date_dt') is not None else []
                     }
                 else:
                     agg[sig]['Accounts'].add(r['Account'])
+                    if r.get('Date_dt') is not None:
+                        agg[sig]['Dates'].append(r['Date_dt'])
 
-            # Build a stable ordered list for rendering
             entries = []
             for sig, v in agg.items():
                 entries.append({
                     'signature': sig,
                     'subject': v['Subject'],
                     'display': v['Display'],
-                    'html': (v['HTML'] if v['HTML'] and v['HTML'] != '-' else ''),
+                    'html': v['HTML'],
                     'accounts_count': len(v['Accounts']),
                     'accounts_list': ', '.join(sorted(v['Accounts']))
                 })
 
-            # Show a two-column layout: left = table, right = previews grid
-            left_col, right_col = st.columns([2, 1])
-            # Build HTML table for left column so we can put copy buttons beside each HTML cell
-            table_rows_html = []
-            for idx, e in enumerate(entries, start=1):
-                # safe values for display in table (escape for innerText/JS string)
-                disp_safe = html_module.escape(e['display'] or '-')
-                subj_safe = html_module.escape(e['subject'] or '-')
-                html_full = e['html'] or ''
-                # JSON-encode html to safely embed in JS
-                html_js = json.dumps(html_full)
-                # put the full html into a <pre> for easier copy, with an id
-                pre_id = f"html_cell_{idx}"
-                copy_btn_id = f"copy_table_btn_{idx}"
-                row_html = f"""
-                <tr style="vertical-align:top; border-bottom:1px solid #ddd;">
-                  <td style="padding:8px; max-width:260px; white-space:normal;">{disp_safe}</td>
-                  <td style="padding:8px; max-width:360px; white-space:normal;">{subj_safe}</td>
-                  <td style="padding:8px; max-width:560px;">
-                    <div style="display:flex; gap:8px; align-items:flex-start;">
-                      <button id="{copy_btn_id}">Copy</button>
-                      <pre id="{pre_id}" style="max-height:140px; overflow:auto; white-space:pre-wrap; word-wrap:break-word; margin:0; padding:6px; border:1px solid #eee; background:#fafafa;">{html_module.escape(html_full)}</pre>
-                    </div>
-                    <script>
-                      document.getElementById("{copy_btn_id}").onclick = function() {{
-                        const txt = {html_js};
-                        navigator.clipboard.writeText(txt).then(()=>{{ this.innerText='Copied'; setTimeout(()=>{{ this.innerText='Copy'; }},1200); }});
-                      }};
-                    </script>
-                  </td>
-                  <td style="padding:8px; text-align:center;">{e['accounts_count']}</td>
-                </tr>
-                """
-                table_rows_html.append(row_html)
+            if not entries:
+                st.info("No creatives to preview.")
+            else:
+                # Render previews grid (2 columns)
+                cols_per_row = 2
+                for row_start in range(0, len(entries), cols_per_row):
+                    cols = st.columns(cols_per_row)
+                    for j in range(cols_per_row):
+                        idx = row_start + j
+                        if idx >= len(entries):
+                            continue
+                        e = entries[idx]
+                        preview_id = f"preview_{idx}_{uuid.uuid4().hex[:6]}"
+                        copy_btn_id = f"copy_{idx}_{uuid.uuid4().hex[:6]}"
+                        box_html = preview_box_html(e['html'], preview_id, copy_btn_id)
+                        with cols[j]:
+                            components.html(box_html, height=220, scrolling=True)
+                            # Below preview show subject, display, accounts
+                            st.markdown(f"**Subject:** {e['subject'] or '-'}  \n**Display:** {e['display'] or '-'}")
+                            st.markdown(f"**Accounts ({e['accounts_count']}):** {e['accounts_list']}")
+                            st.markdown("---")
 
-            full_table_html = f"""
-            <div style="overflow:auto; border:1px solid #eee; padding:6px; border-radius:6px;">
-              <table style="border-collapse:collapse; width:100%; font-family:Arial, sans-serif;">
-                <thead>
-                  <tr style="background:#f7f7f7; text-align:left;">
-                    <th style="padding:10px; width:20%;">Display</th>
-                    <th style="padding:10px; width:25%;">Subject</th>
-                    <th style="padding:10px; width:45%;">HTML (full)</th>
-                    <th style="padding:10px; width:10%;"># Accounts</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {''.join(table_rows_html)}
-                </tbody>
-              </table>
-            </div>
-            """
-
-            with left_col:
-                st.subheader("Single Table — Display | Subject | Full HTML | #Accounts")
-                # Use components.html to render our custom table (so JS copy buttons work)
-                # height scales with number of rows (approx)
-                est_height = max(400, 120 + len(entries) * 80)
-                components.html(full_table_html, height=est_height, scrolling=True)
-
-            # Right column: preview boxes, each with copy at top
-            with right_col:
-                st.subheader("Previews")
-                previews_html_parts = []
-                for idx, e in enumerate(entries, start=1):
-                    sig = e['signature'] if 'signature' in e else str(idx)
-                    html_content = e['html'] or ''
-                    html_js = json.dumps(html_content)
-                    preview_id = f"preview_box_{idx}"
-                    copy_id = f"copy_preview_btn_{idx}"
-                    accounts_text = html_module.escape(e['accounts_list'])
-                    small_box = f"""
-                    <div style="border:1px solid #ddd; border-radius:6px; padding:8px; margin-bottom:12px; background:#fff;">
-                      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                        <div style="font-size:12px; color:#444;"><strong>Accounts:</strong> {e['accounts_count']}</div>
-                        <div>{'<button id="%s">Copy</button>'%copy_id}</div>
-                      </div>
-                      <div id="{preview_id}" style="border:1px solid #f0f0f0; padding:6px; min-height:60px; max-height:220px; overflow:auto; background:#fafafa;">
-                        <!-- HTML will be injected here -->
-                      </div>
-                      <div style="font-size:11px; color:#666; margin-top:6px;">{accounts_text}</div>
-                      <script>
-                        (function() {{
-                          const box = document.getElementById("{preview_id}");
-                          const htmlSource = {html_js};
-                          box.innerHTML = htmlSource || "<div style='color:#666;'>No HTML</div>";
-                          const btn = document.getElementById("{copy_id}");
-                          btn.onclick = function() {{
-                            navigator.clipboard.writeText(htmlSource).then(()=>{{ btn.innerText='Copied'; setTimeout(()=>{{ btn.innerText='Copy'; }},1200); }});
-                          }};
-                        }})();
-                      </script>
-                    </div>
-                    """
-                    previews_html_parts.append(small_box)
-
-                previews_wrapper = "<div style='max-height:800px; overflow:auto;'>" + "".join(previews_html_parts) + "</div>"
-                components.html(previews_wrapper, height=800, scrolling=True)
-
-            st.success("Table + previews rendered. Use Copy buttons in table or in preview boxes to copy full HTML.")
-
-st.markdown('---')
-st.caption('Notes: The table shows the full HTML inside a scrollable <pre> with a copy button. The right column previews every creative and has a copy button at the top of each preview box. If your HTML contains scripts that should not run in the preview, be cautious — previews directly inject the HTML into the page (expected for email templates which are typically HTML/CSS only).')
+            st.success("Done — Sub-ID table above, previews below. Use Copy buttons in preview boxes to copy full HTML.")
+st.markdown("---")
+st.caption("Notes: Sub-IDs are found by scanning Message-ID, headers and message body (including trying base64/urlsafe base64 tokens). Creatives are grouped by exact match of (Subject + Display + HTML).")
