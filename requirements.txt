@@ -7,3 +7,5 @@ scikit-learn
 numpy
 pandas
 joblib
+requests
+openpyxl
