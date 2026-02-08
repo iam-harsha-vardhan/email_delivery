@@ -184,95 +184,100 @@ if uploaded_file:
             
             common_col = list(set(df_rules.columns) & set(df_domains.columns))[0]
             
-            # --- CRITICAL FIX FOR COUNT MISMATCH ---
-            # Remove duplicate rules to prevent checking the same domain multiple times
+            # --- Remove Duplicates in Rules ---
             rules_before = len(df_rules)
             df_rules = df_rules.drop_duplicates(subset=[common_col])
-            rules_after = len(df_rules)
             
-            if rules_before > rules_after:
-                st.warning(f"Note: Found {rules_before - rules_after} duplicate rules in Target_Rules sheet. They were removed to ensure accurate counts.")
-
+            # Merge
             merged = pd.merge(df_domains, df_rules, on=common_col, how='left')
             
             target_col = next(c for c in df_rules.columns if 'target' in c.lower() or 'web' in c.lower())
             source_col = next(c for c in df_domains.columns if 'source' in c.lower() or 'domain' in c.lower())
             
-            # 2. Prepare Data for Threads
+            # 2. Prepare Data for Threads (STRICT FILTERING)
             tasks = []
             for index, row in merged.iterrows():
-                tasks.append({'src': row[source_col], 'tgt': row[target_col]})
+                src = row[source_col]
+                
+                # --- FILTER LOGIC: Skip empty or 'nan' rows ---
+                if pd.isna(src) or str(src).strip() == "" or str(src).lower() == "nan":
+                    continue
+                
+                tasks.append({'src': src, 'tgt': row[target_col]})
             
             total_tasks = len(tasks)
             results = []
             completed_count = 0
             
-            # 3. FAST Multi-threaded Processing (50 workers)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-                futures = [executor.submit(process_single_row, task) for task in tasks]
-                
-                for future in concurrent.futures.as_completed(futures):
-                    result = future.result()
-                    results.append(result)
-                    completed_count += 1
+            if total_tasks == 0:
+                st.warning("No valid domains found to check.")
+            else:
+                # 3. FAST Multi-threaded Processing (50 workers)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+                    futures = [executor.submit(process_single_row, task) for task in tasks]
                     
-                    # Update progress UI
-                    progress_bar.progress(completed_count / total_tasks)
-                    status_text.markdown(f"**⚡ Speed Mode:** Checking **{completed_count}/{total_tasks}**")
+                    for future in concurrent.futures.as_completed(futures):
+                        result = future.result()
+                        results.append(result)
+                        completed_count += 1
+                        
+                        # Update progress UI
+                        progress_bar.progress(completed_count / total_tasks)
+                        status_text.markdown(f"**⚡ Speed Mode:** Checking **{completed_count}/{total_tasks}**")
 
-            # 4. Clean up UI
-            progress_bar.empty()
-            status_text.success(f"✅ Finished checking {total_tasks} domains!")
-            
-            # 5. Process Results
-            df_res = pd.DataFrame(results)
-            
-            # Filter Failed
-            df_failed = df_res[~df_res['Status'].str.contains("MATCH")]
-
-            # Stats
-            passed = len(df_res[df_res['Status'].str.contains("MATCH")])
-            ssl_issues = len(df_res[df_res['Status'].str.contains("SSL")])
-            failed = len(df_res) - passed - ssl_issues
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric("✅ Valid Redirects", passed)
-            c2.metric("🔒 SSL Issues", ssl_issues)
-            c3.metric("❌ Other Issues", failed)
-            
-            def color_status(val):
-                if 'MATCH' in str(val): return 'background-color: #d1fae5; color: #065f46; font-weight: bold'
-                if 'SSL' in str(val): return 'background-color: #ffedd5; color: #c2410c; font-weight: bold'
-                return 'background-color: #fee2e2; color: #991b1b; font-weight: bold'
-
-            st.subheader("Results Table")
-            st.dataframe(df_res.style.map(color_status, subset=['Status']), use_container_width=True)
-            
-            st.divider()
-            st.subheader("Download Reports")
-            
-            btn_col1, btn_col2 = st.columns(2)
-            timestamp = time.strftime('%Y%m%d_%H%M')
-            
-            with btn_col1:
-                st.download_button(
-                    label="📥 Download WHOLE Report (All Data)",
-                    data=convert_df_to_excel(df_res),
-                    file_name=f"Full_Report_{timestamp}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="secondary",
-                    use_container_width=True
-                )
+                # 4. Clean up UI
+                progress_bar.empty()
+                status_text.success(f"✅ Finished checking {total_tasks} valid domains!")
                 
-            with btn_col2:
-                st.download_button(
-                    label="⚠️ Download FAILED ONLY (Errors & SSL)",
-                    data=convert_df_to_excel(df_failed),
-                    file_name=f"Failed_Report_{timestamp}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    use_container_width=True
-                )
+                # 5. Process Results
+                df_res = pd.DataFrame(results)
+                
+                # Filter Failed
+                df_failed = df_res[~df_res['Status'].str.contains("MATCH")]
+
+                # Stats
+                passed = len(df_res[df_res['Status'].str.contains("MATCH")])
+                ssl_issues = len(df_res[df_res['Status'].str.contains("SSL")])
+                failed = len(df_res) - passed - ssl_issues
+                
+                c1, c2, c3 = st.columns(3)
+                c1.metric("✅ Valid Redirects", passed)
+                c2.metric("🔒 SSL Issues", ssl_issues)
+                c3.metric("❌ Other Issues", failed)
+                
+                def color_status(val):
+                    if 'MATCH' in str(val): return 'background-color: #d1fae5; color: #065f46; font-weight: bold'
+                    if 'SSL' in str(val): return 'background-color: #ffedd5; color: #c2410c; font-weight: bold'
+                    return 'background-color: #fee2e2; color: #991b1b; font-weight: bold'
+
+                st.subheader("Results Table")
+                st.dataframe(df_res.style.map(color_status, subset=['Status']), use_container_width=True)
+                
+                st.divider()
+                st.subheader("Download Reports")
+                
+                btn_col1, btn_col2 = st.columns(2)
+                timestamp = time.strftime('%Y%m%d_%H%M')
+                
+                with btn_col1:
+                    st.download_button(
+                        label="📥 Download WHOLE Report (All Data)",
+                        data=convert_df_to_excel(df_res),
+                        file_name=f"Full_Report_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="secondary",
+                        use_container_width=True
+                    )
+                    
+                with btn_col2:
+                    st.download_button(
+                        label="⚠️ Download FAILED ONLY (Errors & SSL)",
+                        data=convert_df_to_excel(df_failed),
+                        file_name=f"Failed_Report_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=True
+                    )
 
         except Exception as e:
             st.error(f"An error occurred: {e}")
