@@ -4,6 +4,7 @@ import requests
 import io
 import time
 import urllib3
+import concurrent.futures
 from urllib.parse import urlparse
 
 # 1. Hide "Insecure Request" warnings
@@ -23,9 +24,7 @@ st.markdown("""
 # --- Helper Functions ---
 
 def clean_url_logic(url):
-    """
-    Strips 'http://', 'https://', 'www.', and trailing slashes for COMPARISON.
-    """
+    """Strips protocol and www for comparison."""
     if not url: return ""
     u = str(url).strip().lower()
     if u.startswith("https://"): u = u[8:]
@@ -34,14 +33,11 @@ def clean_url_logic(url):
     return u.rstrip('/')
 
 def make_request(url):
-    """
-    Tries to connect with REAL BROWSER HEADERS to avoid 403 Forbidden.
-    """
+    """Tries to connect with REAL BROWSER HEADERS."""
     target_url = url.strip()
     if not target_url.startswith(('http://', 'https://')):
         target_url = 'http://' + target_url 
 
-    # HEADERS TO AVOID 403 BLOCKING
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -94,17 +90,13 @@ def check_redirect(source, expected_target):
         core_actual = clean_url_logic(final_url)
         
         # --- COMPARISON LOGIC ---
-        
         if core_expected == core_actual:
             result["Status"] = "✅ MATCH"
             result["Details"] = "OK"
-            
         elif core_expected in core_actual:
             result["Status"] = "✅ MATCH"
             result["Details"] = "OK (Sub-page)"
-            
         else:
-            # Handle 403s explicitly (False positives)
             if response.status_code == 403:
                 if core_expected in core_actual:
                     result["Status"] = "✅ MATCH"
@@ -134,6 +126,19 @@ def check_redirect(source, expected_target):
         
     return result
 
+# Wrapper for Threading
+def process_single_row(row_data):
+    src = row_data['src']
+    tgt = row_data['tgt']
+    
+    if pd.isna(tgt) or str(tgt).strip() == "":
+        return {
+            "Source Domain": src, "Status": "⚠️ NO TARGET", 
+            "Actual Final URL": "-", "Details": "No target in rules sheet"
+        }
+    else:
+        return check_redirect(src, tgt)
+
 def convert_df_to_excel(df):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
@@ -150,7 +155,6 @@ def generate_sample_file():
 # --- Main App ---
 
 st.title("Redirect Validator Pro 🚀")
-st.info("Validation logic: Ignores `http/https` and `www`. Marks SSL failures specifically.")
 
 with st.sidebar:
     st.header("Actions")
@@ -159,97 +163,111 @@ with st.sidebar:
 uploaded_file = st.file_uploader("Upload Excel File", type=['xlsx', 'xls'])
 
 if uploaded_file:
-    if st.button("Start Validation", type="primary"):
-        with st.spinner("Processing redirects..."):
-            try:
-                xls = pd.ExcelFile(uploaded_file)
-                all_sheets = xls.sheet_names
-                sheet_rules = next((s for s in all_sheets if 'target' in s.lower() or 'rule' in s.lower()), all_sheets[0])
-                sheet_domains = next((s for s in all_sheets if 'source' in s.lower() or 'domain' in s.lower()), all_sheets[1] if len(all_sheets)>1 else all_sheets[0])
+    if st.button("🚀 Start Validation", type="primary"):
+        
+        # UI Elements
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            # 1. Read Data
+            xls = pd.ExcelFile(uploaded_file)
+            all_sheets = xls.sheet_names
+            sheet_rules = next((s for s in all_sheets if 'target' in s.lower() or 'rule' in s.lower()), all_sheets[0])
+            sheet_domains = next((s for s in all_sheets if 'source' in s.lower() or 'domain' in s.lower()), all_sheets[1] if len(all_sheets)>1 else all_sheets[0])
+            
+            df_rules = pd.read_excel(uploaded_file, sheet_name=sheet_rules)
+            df_domains = pd.read_excel(uploaded_file, sheet_name=sheet_domains)
+            
+            df_rules.columns = df_rules.columns.str.strip()
+            df_domains.columns = df_domains.columns.str.strip()
+            
+            common_col = list(set(df_rules.columns) & set(df_domains.columns))[0]
+            merged = pd.merge(df_domains, df_rules, on=common_col, how='left')
+            
+            target_col = next(c for c in df_rules.columns if 'target' in c.lower() or 'web' in c.lower())
+            source_col = next(c for c in df_domains.columns if 'source' in c.lower() or 'domain' in c.lower())
+            
+            # 2. Prepare Data for Threads
+            # Convert dataframe to list of dicts for safe threading
+            tasks = []
+            for index, row in merged.iterrows():
+                tasks.append({'src': row[source_col], 'tgt': row[target_col]})
+            
+            total_tasks = len(tasks)
+            results = []
+            completed_count = 0
+            
+            # 3. FAST Multi-threaded Processing (50 workers)
+            # This runs 50 checks at the same time
+            with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+                # Submit all tasks
+                futures = [executor.submit(process_single_row, task) for task in tasks]
                 
-                df_rules = pd.read_excel(uploaded_file, sheet_name=sheet_rules)
-                df_domains = pd.read_excel(uploaded_file, sheet_name=sheet_domains)
-                
-                df_rules.columns = df_rules.columns.str.strip()
-                df_domains.columns = df_domains.columns.str.strip()
-                
-                common_col = list(set(df_rules.columns) & set(df_domains.columns))[0]
-                merged = pd.merge(df_domains, df_rules, on=common_col, how='left')
-                
-                target_col = next(c for c in df_rules.columns if 'target' in c.lower() or 'web' in c.lower())
-                source_col = next(c for c in df_domains.columns if 'source' in c.lower() or 'domain' in c.lower())
-                
-                results = []
-                bar = st.progress(0)
-                status_txt = st.empty()
-                
-                for i, row in merged.iterrows():
-                    bar.progress((i+1)/len(merged))
-                    src = row[source_col]
-                    tgt = row[target_col]
-                    status_txt.caption(f"Checking: {src}")
+                # As they complete, update UI
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    results.append(result)
                     
-                    if pd.isna(tgt) or str(tgt).strip() == "":
-                        results.append({
-                            "Source Domain": src, "Status": "⚠️ NO TARGET", 
-                            "Actual Final URL": "-", "Details": "No target in rules sheet"
-                        })
-                    else:
-                        results.append(check_redirect(src, tgt))
-                        
-                bar.empty()
-                status_txt.empty()
-                
-                # --- RESULTS ---
-                df_res = pd.DataFrame(results)
-                
-                # Filter for the "Failed" Report (Anything not MATCH)
-                df_failed = df_res[~df_res['Status'].str.contains("MATCH")]
+                    completed_count += 1
+                    # Update progress
+                    progress_bar.progress(completed_count / total_tasks)
+                    # Update text counter
+                    status_text.markdown(f"**⚡ Speed Mode:** Processed **{completed_count}/{total_tasks}**")
 
-                # Stats
-                passed = len(df_res[df_res['Status'].str.contains("MATCH")])
-                ssl_issues = len(df_res[df_res['Status'].str.contains("SSL")])
-                failed = len(df_res) - passed - ssl_issues
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("✅ Valid Redirects", passed)
-                c2.metric("🔒 SSL Issues", ssl_issues)
-                c3.metric("❌ Other Issues", failed)
-                
-                def color_status(val):
-                    if 'MATCH' in str(val): return 'background-color: #d1fae5; color: #065f46; font-weight: bold'
-                    if 'SSL' in str(val): return 'background-color: #ffedd5; color: #c2410c; font-weight: bold'
-                    return 'background-color: #fee2e2; color: #991b1b; font-weight: bold'
+            # 4. Clean up UI
+            progress_bar.empty()
+            status_text.success(f"✅ Finished checking all {total_tasks} domains!")
+            
+            # 5. Process Results
+            df_res = pd.DataFrame(results)
+            
+            # Filter Failed
+            df_failed = df_res[~df_res['Status'].str.contains("MATCH")]
 
-                st.dataframe(df_res.style.map(color_status, subset=['Status']), use_container_width=True)
-                
-                st.divider()
-                st.subheader("Download Reports")
-                
-                # Side-by-Side Buttons
-                btn_col1, btn_col2 = st.columns(2)
-                
-                timestamp = time.strftime('%Y%m%d_%H%M')
-                
-                with btn_col1:
-                    st.download_button(
-                        label="📥 Download WHOLE Report (All Data)",
-                        data=convert_df_to_excel(df_res),
-                        file_name=f"Full_Report_{timestamp}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="secondary",
-                        use_container_width=True
-                    )
-                    
-                with btn_col2:
-                    st.download_button(
-                        label="⚠️ Download FAILED ONLY (Errors & SSL)",
-                        data=convert_df_to_excel(df_failed),
-                        file_name=f"Failed_Report_{timestamp}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="primary", # Primary color highlights this as important
-                        use_container_width=True
-                    )
+            # Stats
+            passed = len(df_res[df_res['Status'].str.contains("MATCH")])
+            ssl_issues = len(df_res[df_res['Status'].str.contains("SSL")])
+            failed = len(df_res) - passed - ssl_issues
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("✅ Valid Redirects", passed)
+            c2.metric("🔒 SSL Issues", ssl_issues)
+            c3.metric("❌ Other Issues", failed)
+            
+            def color_status(val):
+                if 'MATCH' in str(val): return 'background-color: #d1fae5; color: #065f46; font-weight: bold'
+                if 'SSL' in str(val): return 'background-color: #ffedd5; color: #c2410c; font-weight: bold'
+                return 'background-color: #fee2e2; color: #991b1b; font-weight: bold'
 
-            except Exception as e:
-                st.error(f"Error: {e}")
+            st.subheader("Results Table")
+            st.dataframe(df_res.style.map(color_status, subset=['Status']), use_container_width=True)
+            
+            st.divider()
+            st.subheader("Download Reports")
+            
+            btn_col1, btn_col2 = st.columns(2)
+            timestamp = time.strftime('%Y%m%d_%H%M')
+            
+            with btn_col1:
+                st.download_button(
+                    label="📥 Download WHOLE Report (All Data)",
+                    data=convert_df_to_excel(df_res),
+                    file_name=f"Full_Report_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="secondary",
+                    use_container_width=True
+                )
+                
+            with btn_col2:
+                st.download_button(
+                    label="⚠️ Download FAILED ONLY (Errors & SSL)",
+                    data=convert_df_to_excel(df_failed),
+                    file_name=f"Failed_Report_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True
+                )
+
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
