@@ -183,13 +183,22 @@ if uploaded_file:
             df_domains.columns = df_domains.columns.str.strip()
             
             common_col = list(set(df_rules.columns) & set(df_domains.columns))[0]
+            
+            # --- CRITICAL FIX FOR COUNT MISMATCH ---
+            # Remove duplicate rules to prevent checking the same domain multiple times
+            rules_before = len(df_rules)
+            df_rules = df_rules.drop_duplicates(subset=[common_col])
+            rules_after = len(df_rules)
+            
+            if rules_before > rules_after:
+                st.warning(f"Note: Found {rules_before - rules_after} duplicate rules in Target_Rules sheet. They were removed to ensure accurate counts.")
+
             merged = pd.merge(df_domains, df_rules, on=common_col, how='left')
             
             target_col = next(c for c in df_rules.columns if 'target' in c.lower() or 'web' in c.lower())
             source_col = next(c for c in df_domains.columns if 'source' in c.lower() or 'domain' in c.lower())
             
             # 2. Prepare Data for Threads
-            # Convert dataframe to list of dicts for safe threading
             tasks = []
             for index, row in merged.iterrows():
                 tasks.append({'src': row[source_col], 'tgt': row[target_col]})
@@ -199,25 +208,21 @@ if uploaded_file:
             completed_count = 0
             
             # 3. FAST Multi-threaded Processing (50 workers)
-            # This runs 50 checks at the same time
             with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-                # Submit all tasks
                 futures = [executor.submit(process_single_row, task) for task in tasks]
                 
-                # As they complete, update UI
                 for future in concurrent.futures.as_completed(futures):
                     result = future.result()
                     results.append(result)
-                    
                     completed_count += 1
-                    # Update progress
+                    
+                    # Update progress UI
                     progress_bar.progress(completed_count / total_tasks)
-                    # Update text counter
-                    status_text.markdown(f"**⚡ Speed Mode:** Processed **{completed_count}/{total_tasks}**")
+                    status_text.markdown(f"**⚡ Speed Mode:** Checking **{completed_count}/{total_tasks}**")
 
             # 4. Clean up UI
             progress_bar.empty()
-            status_text.success(f"✅ Finished checking all {total_tasks} domains!")
+            status_text.success(f"✅ Finished checking {total_tasks} domains!")
             
             # 5. Process Results
             df_res = pd.DataFrame(results)
