@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Page Config ---
-st.set_page_config(page_title="Redirect Validator Pro", page_icon="✅", layout="wide")
+st.set_page_config(page_title="Redirect Validator", page_icon="✅", layout="wide")
 
 # --- CSS Styling ---
 st.markdown("""
@@ -154,7 +154,7 @@ def generate_sample_file():
 
 # --- Main App ---
 
-st.title("Redirect Validator Pro 🚀")
+st.title("Redirect Validator 🚀")
 
 with st.sidebar:
     st.header("Actions")
@@ -235,15 +235,8 @@ if uploaded_file:
                 # Filter Failed
                 df_failed = df_res[~df_res['Status'].str.contains("MATCH")]
 
-                # Stats
-                passed = len(df_res[df_res['Status'].str.contains("MATCH")])
-                ssl_issues = len(df_res[df_res['Status'].str.contains("SSL")])
-                failed = len(df_res) - passed - ssl_issues
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("✅ Valid Redirects", passed)
-                c2.metric("🔒 SSL Issues", ssl_issues)
-                c3.metric("❌ Other Issues", failed)
+                # START INDEX AT 1
+                df_res.index = df_res.index + 1
                 
                 def color_status(val):
                     if 'MATCH' in str(val): return 'background-color: #d1fae5; color: #065f46; font-weight: bold'
@@ -251,7 +244,8 @@ if uploaded_file:
                     return 'background-color: #fee2e2; color: #991b1b; font-weight: bold'
 
                 st.subheader("Results Table")
-                st.dataframe(df_res.style.map(color_status, subset=['Status']), use_container_width=True)
+                # HEIGHT=600 makes it scrollable vertically
+                st.dataframe(df_res.style.map(color_status, subset=['Status']), use_container_width=True, height=600)
                 
                 st.divider()
                 st.subheader("Download Reports")
@@ -261,7 +255,7 @@ if uploaded_file:
                 
                 with btn_col1:
                     st.download_button(
-                        label="📥 Download WHOLE Report (All Data)",
+                        label="Download Whole Report",
                         data=convert_df_to_excel(df_res),
                         file_name=f"Full_Report_{timestamp}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -271,7 +265,7 @@ if uploaded_file:
                     
                 with btn_col2:
                     st.download_button(
-                        label="⚠️ Download FAILED ONLY (Errors & SSL)",
+                        label="Download Failed Only",
                         data=convert_df_to_excel(df_failed),
                         file_name=f"Failed_Report_{timestamp}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
