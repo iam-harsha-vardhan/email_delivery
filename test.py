@@ -1,277 +1,239 @@
 import streamlit as st
+import imaplib
+import email
+from email.header import decode_header
+from email.utils import parsedate_to_datetime
+import datetime
+import re
 import pandas as pd
-import requests
-import io
-import time
-import urllib3
-import concurrent.futures
-from urllib.parse import urlparse
+import base64
 
-# 1. Hide "Insecure Request" warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# --- Page Setup ---
+st.set_page_config(page_title="Email Auth Checker", layout="wide")
+st.title("📧 Email Authentication Report (SPF/DKIM/DMARC)")
 
-# --- Page Config ---
-st.set_page_config(page_title="Redirect Validator", page_icon="✅", layout="wide")
+# Added FROM column
+DF_COLS = [
+    "Subject", "Date", "From",
+    "SPF", "DKIM", "DMARC",
+    "Domain", "Type", "Sub ID",
+    "Message-ID", "Mailbox", "Batch_ID"
+]
 
-# --- CSS Styling ---
-st.markdown("""
-<style>
-    .stButton>button { width: 100%; height: 3em; border-radius: 8px; font-weight: bold; }
-    div[data-testid="column"] { text-align: center; }
-</style>
-""", unsafe_allow_html=True)
+# --- Session state setup ---
+if 'df' not in st.session_state:
+    st.session_state.df = pd.DataFrame(columns=DF_COLS)
+if 'last_uid' not in st.session_state:
+    st.session_state.last_uid = None
+if 'spam_df' not in st.session_state:
+    st.session_state.spam_df = pd.DataFrame(columns=DF_COLS)
+if 'email_input' not in st.session_state:
+    st.session_state.email_input = ""
+if 'password_input' not in st.session_state:
+    st.session_state.password_input = ""
+if 'batch_counter' not in st.session_state:
+    st.session_state.batch_counter = 0
 
-# --- Helper Functions ---
+today = datetime.date.today()
+if 'fetch_dates' not in st.session_state or st.session_state.fetch_dates is None:
+    st.session_state.fetch_dates = (today, today)
 
-def clean_url_logic(url):
-    """Strips protocol and www for comparison."""
-    if not url: return ""
-    u = str(url).strip().lower()
-    if u.startswith("https://"): u = u[8:]
-    if u.startswith("http://"): u = u[7:]
-    if u.startswith("www."): u = u[4:]
-    return u.rstrip('/')
-
-def make_request(url):
-    """Tries to connect with REAL BROWSER HEADERS."""
-    target_url = url.strip()
-    if not target_url.startswith(('http://', 'https://')):
-        target_url = 'http://' + target_url 
-
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
-    }
-    
-    try:
-        # Try 1: As provided
-        response = requests.get(target_url, headers=headers, allow_redirects=True, timeout=10, verify=False)
-        return response
-    except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.SSLError):
-        # Try 2: Swap protocol
-        try:
-            if target_url.startswith("http://"):
-                retry_url = target_url.replace("http://", "https://", 1)
-            else:
-                retry_url = target_url.replace("https://", "http://", 1)
-            
-            response = requests.get(retry_url, headers=headers, allow_redirects=True, timeout=10, verify=False)
-            return response
-        except Exception as e:
-            raise e
-
-def check_redirect(source, expected_target):
-    # Typo Check
-    if expected_target and "httpts" in str(expected_target):
-        return {
-            "Source Domain": source, "Expected Target": expected_target,
-            "Actual Final URL": "-", "Status": "❗ TYPO", "Details": "Fix 'httpts' in Excel"
-        }
-
-    core_expected = clean_url_logic(expected_target)
-    
-    result = {
-        "Source Domain": source,
-        "Expected Target": expected_target,
-        "Actual Final URL": "-",
-        "Status": "Checking...",
-        "Details": ""
-    }
-    
-    try:
-        response = make_request(source)
-        
-        final_url = response.url
-        result["Actual Final URL"] = final_url
-        core_actual = clean_url_logic(final_url)
-        
-        # --- COMPARISON LOGIC ---
-        if core_expected == core_actual:
-            result["Status"] = "✅ MATCH"
-            result["Details"] = "OK"
-        elif core_expected in core_actual:
-            result["Status"] = "✅ MATCH"
-            result["Details"] = "OK (Sub-page)"
+# --- Input UI ---
+with st.container():
+    col1, col2, col3, col4 = st.columns([3,3,2,1])
+    with col1:
+        email_input = st.text_input("📧 Gmail Address", key="email_box")
+    with col2:
+        password_input = st.text_input("🔐 App Password", type="password", key="pwd_box")
+    with col3:
+        date_range = st.date_input("Select Date Range",
+            value=st.session_state.fetch_dates,
+            max_value=today,
+            key="date_box"
+        )
+        if isinstance(date_range, tuple) and len(date_range)==2:
+            s,e=date_range
+            if s>e: s,e=e,s
+            st.session_state.fetch_dates=(s,e)
+        elif isinstance(date_range, datetime.date):
+            st.session_state.fetch_dates=(date_range,date_range)
         else:
-            if response.status_code == 403:
-                if core_expected in core_actual:
-                    result["Status"] = "✅ MATCH"
-                    result["Details"] = "OK (Ignore 403)"
-                else:
-                    result["Status"] = "❌ BROKEN"
-                    result["Details"] = "Access Denied (403)"
-            elif response.status_code >= 400:
-                result["Status"] = "❌ BROKEN"
-                result["Details"] = f"Page Error: {response.status_code}"
-            else:
-                result["Status"] = "❌ MISMATCH"
-                result["Details"] = "Redirected to wrong site"
+            st.session_state.fetch_dates=(today,today)
+    with col4:
+        st.markdown("####")
+        if st.button("🔁"):
+            for key in list(st.session_state.keys()):
+                if key not in ['date_box','fetch_dates']:
+                    del st.session_state[key]
+            st.rerun()
 
-    except requests.exceptions.SSLError:
-        result["Status"] = "🔒 SSL ISSUE"
-        result["Details"] = "Enable SSL on Source Domain"
-    except requests.exceptions.ConnectionError:
-        result["Status"] = "🚫 DOWN"
-        result["Details"] = "Connection Refused (DNS/Server)"
-    except requests.exceptions.Timeout:
-        result["Status"] = "⏱️ TIMEOUT"
-        result["Details"] = "Server too slow (>10s)"
-    except Exception as e:
-        result["Status"] = "❗ ERROR"
-        result["Details"] = str(e)
-        
-    return result
+st.session_state.email_input=email_input
+st.session_state.password_input=password_input
 
-# Wrapper for Threading
-def process_single_row(row_data):
-    src = row_data['src']
-    tgt = row_data['tgt']
-    
-    if pd.isna(tgt) or str(tgt).strip() == "":
-        return {
-            "Source Domain": src, "Status": "⚠️ NO TARGET", 
-            "Actual Final URL": "-", "Details": "No target in rules sheet"
-        }
-    else:
-        return check_redirect(src, tgt)
+if not email_input or not password_input:
+    st.warning("Enter Gmail + App Password")
+    st.stop()
 
-def convert_df_to_excel(df):
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False)
-    return buffer.getvalue()
+START_DATE, END_DATE = st.session_state.fetch_dates
+IS_DEFAULT_TODAY = START_DATE==today and END_DATE==today
+IS_SINGLE_DAY = START_DATE==END_DATE
 
-def generate_sample_file():
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pd.DataFrame({'Feed Name': ['ExampleFeed'], 'Target Website': ['arise-cash.com']}).to_excel(writer, sheet_name='Target_Rules', index=False)
-        pd.DataFrame({'Feed Name': ['ExampleFeed'], 'Source Domain': ['arisefinancepro.com']}).to_excel(writer, sheet_name='Source_Domains', index=False)
-    return output.getvalue()
+# ---------- UTILITIES ----------
 
-# --- Main App ---
-
-st.title("Redirect Validator 🚀")
-
-with st.sidebar:
-    st.header("Actions")
-    st.download_button("📥 Download Template", generate_sample_file(), "redirect_template.xlsx")
-
-uploaded_file = st.file_uploader("Upload Excel File", type=['xlsx', 'xls'])
-
-if uploaded_file:
-    if st.button("🚀 Start Validation", type="primary"):
-        
-        # UI Elements
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
+def decode_mime_words(s):
+    if not s: return ""
+    out=""
+    for part,enc in decode_header(s):
         try:
-            # 1. Read Data
-            xls = pd.ExcelFile(uploaded_file)
-            all_sheets = xls.sheet_names
-            sheet_rules = next((s for s in all_sheets if 'target' in s.lower() or 'rule' in s.lower()), all_sheets[0])
-            sheet_domains = next((s for s in all_sheets if 'source' in s.lower() or 'domain' in s.lower()), all_sheets[1] if len(all_sheets)>1 else all_sheets[0])
-            
-            df_rules = pd.read_excel(uploaded_file, sheet_name=sheet_rules)
-            df_domains = pd.read_excel(uploaded_file, sheet_name=sheet_domains)
-            
-            df_rules.columns = df_rules.columns.str.strip()
-            df_domains.columns = df_domains.columns.str.strip()
-            
-            common_col = list(set(df_rules.columns) & set(df_domains.columns))[0]
-            
-            # --- Remove Duplicates in Rules ---
-            rules_before = len(df_rules)
-            df_rules = df_rules.drop_duplicates(subset=[common_col])
-            
-            # Merge
-            merged = pd.merge(df_domains, df_rules, on=common_col, how='left')
-            
-            target_col = next(c for c in df_rules.columns if 'target' in c.lower() or 'web' in c.lower())
-            source_col = next(c for c in df_domains.columns if 'source' in c.lower() or 'domain' in c.lower())
-            
-            # 2. Prepare Data for Threads (STRICT FILTERING)
-            tasks = []
-            for index, row in merged.iterrows():
-                src = row[source_col]
-                
-                # --- FILTER LOGIC: Skip empty or 'nan' rows ---
-                if pd.isna(src) or str(src).strip() == "" or str(src).lower() == "nan":
-                    continue
-                
-                tasks.append({'src': src, 'tgt': row[target_col]})
-            
-            total_tasks = len(tasks)
-            results = []
-            completed_count = 0
-            
-            if total_tasks == 0:
-                st.warning("No valid domains found to check.")
+            if isinstance(part,bytes):
+                out+=part.decode(enc or 'utf-8',errors='ignore')
             else:
-                # 3. FAST Multi-threaded Processing (50 workers)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-                    futures = [executor.submit(process_single_row, task) for task in tasks]
-                    
-                    for future in concurrent.futures.as_completed(futures):
-                        result = future.result()
-                        results.append(result)
-                        completed_count += 1
-                        
-                        # Update progress UI
-                        progress_bar.progress(completed_count / total_tasks)
-                        status_text.markdown(f"**⚡ Speed Mode:** Checking **{completed_count}/{total_tasks}**")
+                out+=part
+        except:
+            out+=part.decode('utf-8','ignore') if isinstance(part,bytes) else str(part)
+    return out.strip()
 
-                # 4. Clean up UI
-                progress_bar.empty()
-                status_text.success(f"✅ Finished checking {total_tasks} valid domains!")
-                
-                # 5. Process Results
-                df_res = pd.DataFrame(results)
-                
-                # Filter Failed
-                df_failed = df_res[~df_res['Status'].str.contains("MATCH")]
+def format_date_ist(date_str):
+    if not date_str: return "-"
+    try:
+        dt=parsedate_to_datetime(date_str)
+        ist=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
+        return dt.astimezone(ist).strftime("%d-%b-%Y %I:%M %p")
+    except:
+        return str(date_str)
 
-                # START INDEX AT 1
-                df_res.index = df_res.index + 1
-                
-                def color_status(val):
-                    if 'MATCH' in str(val): return 'background-color: #d1fae5; color: #065f46; font-weight: bold'
-                    if 'SSL' in str(val): return 'background-color: #ffedd5; color: #c2410c; font-weight: bold'
-                    return 'background-color: #fee2e2; color: #991b1b; font-weight: bold'
+def extract_id_details(search_string,data):
+    m=re.search(r'(GTC-[^@_]+|GMFP-[^@_]+|GRM-[^@_]+|GRTC-[^@_]+)',search_string,re.I)
+    if m:
+        sid=m.group(1)
+        data["Sub ID"]=sid
+        l=sid.lower()
+        if 'grm' in l: data["Type"]='FPR'
+        elif 'gmfp' in l: data["Type"]='FP'
+        elif 'gtc' in l: data["Type"]='FPTC'
+        elif 'grtc' in l: data["Type"]='FPRTC'
+        return True
+    return False
 
-                st.subheader("Results Table")
-                # HEIGHT=600 makes it scrollable vertically
-                st.dataframe(df_res.style.map(color_status, subset=['Status']), use_container_width=True, height=600)
-                
-                st.divider()
-                st.subheader("Download Reports")
-                
-                btn_col1, btn_col2 = st.columns(2)
-                timestamp = time.strftime('%Y%m%d_%H%M')
-                
-                with btn_col1:
-                    st.download_button(
-                        label="Download Whole Report",
-                        data=convert_df_to_excel(df_res),
-                        file_name=f"Full_Report_{timestamp}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="secondary",
-                        use_container_width=True
-                    )
-                    
-                with btn_col2:
-                    st.download_button(
-                        label="Download Failed Only",
-                        data=convert_df_to_excel(df_failed),
-                        file_name=f"Failed_Report_{timestamp}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="primary",
-                        use_container_width=True
-                    )
+def parse_email_message(msg,batch_id):
+    raw_date=msg.get("Date","")
+    data={
+        "Subject":decode_mime_words(msg.get("Subject","No Subject")),
+        "Date":format_date_ist(raw_date),
+        "From":decode_mime_words(msg.get("From","")),
+        "SPF":"-","DKIM":"-","DMARC":"-","Domain":"-",
+        "Type":"-","Sub ID":"-",
+        "Message-ID":decode_mime_words(msg.get("Message-ID","")),
+        "Batch_ID":batch_id
+    }
 
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
+    headers_str=''.join(f"{h}: {v}\n" for h,v in msg.items())
+
+    m=re.search(r'Authentication-Results:.*?smtp.mailfrom=([\w\.-]+)',headers_str,re.I)
+    if m:
+        data["Domain"]=m.group(1).lower()
+    else:
+        f=data["From"]
+        m=re.search(r'<(?:.+@)?([\w\.-]+)>|@([\w\.-]+)$',f)
+        if m:
+            data["Domain"]=(m.group(1) or m.group(2)).lower()
+
+    for key in ["spf","dkim","dmarc"]:
+        m=re.search(fr'{key}=(\w+)',headers_str,re.I)
+        if m: data[key.upper()]=m.group(1).lower()
+
+    if not extract_id_details(headers_str,data):
+        for h,v in msg.items():
+            if not v: continue
+            for part in str(v).split('_'):
+                if len(part)<20: continue
+                try:
+                    dec=base64.b64decode(part+'='*(-len(part)%4)).decode('utf-8','ignore')
+                    if extract_id_details(dec,data): break
+                except: pass
+            if data["Type"]!="-": break
+    return data
+
+def fetch_emails(start_date,end_date,mailbox="inbox",use_uid_since=False,last_uid=None,current_batch_id=0):
+    results=[]
+    s=start_date.strftime("%d-%b-%Y")
+    e=(end_date+datetime.timedelta(days=1)).strftime("%d-%b-%Y")
+    new_last=last_uid
+    try:
+        imap=imaplib.IMAP4_SSL("imap.gmail.com")
+        imap.login(st.session_state.email_input,st.session_state.password_input)
+        imap.select(mailbox)
+        if mailbox=="inbox" and use_uid_since and last_uid:
+            criteria=f'(UID {int(last_uid)+1}:* SINCE {s} BEFORE {e})'
+        else:
+            criteria=f'(SINCE {s} BEFORE {e})'
+        status,data=imap.uid('search',None,criteria)
+        uids=data[0].split()
+        for uid in uids:
+            _,msg_data=imap.uid('fetch',uid,'(BODY.PEEK[HEADER])')
+            for part in msg_data:
+                if isinstance(part,tuple):
+                    msg=email.message_from_bytes(part[1])
+                    d=parse_email_message(msg,current_batch_id)
+                    d["Mailbox"]="Inbox" if mailbox=="inbox" else "Spam"
+                    results.append(d)
+            if mailbox=="inbox":
+                new_last=max(new_last,uid.decode()) if new_last else uid.decode()
+        imap.logout()
+    except Exception as e:
+        st.error(str(e))
+    return pd.DataFrame(results,columns=DF_COLS), new_last
+
+def process_fetch_results(new_df,new_uid,target_df):
+    if not target_df.empty:
+        seen=set(target_df["Message-ID"].dropna())
+        new_df=new_df[~new_df["Message-ID"].isin(seen)]
+    if not new_df.empty:
+        combined=pd.concat([new_df,target_df],ignore_index=True)
+        combined=combined.sort_values(by='Batch_ID',ascending=False,ignore_index=True)
+        return combined,len(new_df),new_uid
+    return target_df,0,new_uid
+
+# ---------- FETCH BUTTON ----------
+if st.button("📥 Fetch Emails"):
+    st.session_state.batch_counter+=1
+    b=st.session_state.batch_counter
+    use_uid=not st.session_state.df.empty and st.session_state.last_uid is not None
+    with st.spinner("Fetching..."):
+        inbox,new_uid=fetch_emails(START_DATE,END_DATE,"inbox",use_uid,st.session_state.last_uid,b)
+        spam,_=fetch_emails(START_DATE,END_DATE,"[Gmail]/Spam",False,None,b)
+        df_new=pd.concat([inbox,spam],ignore_index=True)
+        st.session_state.df,count,st.session_state.last_uid=process_fetch_results(df_new,new_uid,st.session_state.df)
+        st.success(f"Fetched {count} emails")
+
+# ---------- MAIN TABLE ----------
+st.subheader("📬 Processed Emails")
+if not st.session_state.df.empty:
+    inbox_cols=["Subject","From","Date","Domain","SPF","DKIM","DMARC","Type","Mailbox","Batch_ID"]
+    display_df=st.session_state.df.reindex(columns=inbox_cols,fill_value="-")
+    display_df.index=display_df.index+1
+    st.dataframe(display_df,use_container_width=True,column_config={"Batch_ID":None})
+
+# ---------- FAILED AUTH ----------
+if not st.session_state.df.empty:
+    failed=st.session_state.df[
+        (st.session_state.df["SPF"]!="pass")|
+        (st.session_state.df["DKIM"]!="pass")|
+        (st.session_state.df["DMARC"]!="pass")
+    ]
+    if not failed.empty:
+        st.subheader("❌ Failed Auth Emails")
+        failed_cols=["Subject","From","Date","Domain","SPF","DKIM","DMARC","Type","Sub ID","Mailbox"]
+        failed_display=failed[failed_cols].copy()
+        failed_display.index=failed_display.index+1
+        st.dataframe(failed_display,use_container_width=True)
+    else:
+        st.success("All emails passed authentication")
+
+# ---------- SPAM ----------
+if not st.session_state.spam_df.empty:
+    st.subheader("🚫 Spam Folder Emails")
+    spam_cols=["Subject","From","Date","Domain","Type","Mailbox","Batch_ID"]
+    display_spam=st.session_state.spam_df.reindex(columns=spam_cols,fill_value="-")
+    display_spam.index=display_spam.index+1
+    st.dataframe(display_spam,use_container_width=True,column_config={"Batch_ID":None})
