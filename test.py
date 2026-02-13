@@ -22,8 +22,6 @@ DF_COLS = [
 # ---------------- SESSION STATE ----------------
 if 'df' not in st.session_state:
     st.session_state.df = pd.DataFrame(columns=DF_COLS)
-if 'spam_df' not in st.session_state:
-    st.session_state.spam_df = pd.DataFrame(columns=DF_COLS)
 if 'last_uid' not in st.session_state:
     st.session_state.last_uid = None
 if 'batch_counter' not in st.session_state:
@@ -40,33 +38,28 @@ with st.container():
     col1, col2, col3, col4 = st.columns([3, 3, 2, 1])
 
     with col1:
-        email_input = st.text_input("📧 Gmail Address", key="email_box")
+        email_input = st.text_input("📧 Gmail Address")
 
     with col2:
-        password_input = st.text_input("🔐 App Password", type="password", key="pwd_box")
+        password_input = st.text_input("🔐 App Password", type="password")
 
     with col3:
         date_range = st.date_input(
             "Select Date Range",
             value=st.session_state.fetch_dates,
-            max_value=today,
-            key="date_box"
+            max_value=today
         )
 
-        if isinstance(date_range, tuple) and len(date_range) == 2:
+        if isinstance(date_range, tuple):
             s, e = date_range
             if s > e:
                 s, e = e, s
             st.session_state.fetch_dates = (s, e)
-        elif isinstance(date_range, datetime.date):
-            st.session_state.fetch_dates = (date_range, date_range)
 
     with col4:
         st.markdown("####")
         if st.button("🔁"):
-            for key in list(st.session_state.keys()):
-                if key not in ['date_box', 'fetch_dates']:
-                    del st.session_state[key]
+            st.session_state.clear()
             st.rerun()
 
 if not email_input or not password_input:
@@ -100,7 +93,6 @@ def format_date_ist(date_str):
         return "-"
 
 def parse_email_message(msg, batch_id):
-
     raw_date = msg.get("Date", "")
     from_header = decode_mime_words(msg.get("From", ""))
 
@@ -108,12 +100,9 @@ def parse_email_message(msg, batch_id):
     domain = "-"
 
     if "<" in from_header and "@" in from_header:
-        try:
-            display_name = from_header.split("<")[0].strip().strip('"')
-            email_part = from_header.split("<")[1].split(">")[0]
-            domain = email_part.split("@")[1].lower()
-        except:
-            pass
+        display_name = from_header.split("<")[0].strip().strip('"')
+        email_part = from_header.split("<")[1].split(">")[0]
+        domain = email_part.split("@")[1].lower()
 
     data = {
         "Subject": decode_mime_words(msg.get("Subject", "No Subject")),
@@ -137,8 +126,7 @@ def parse_email_message(msg, batch_id):
 
 # ---------------- FETCH ----------------
 
-def fetch_emails(start_date, end_date, mailbox="inbox", last_uid=None, batch_id=0):
-
+def fetch_emails(start_date, end_date, mailbox="inbox", batch_id=0):
     results = []
     s = start_date.strftime("%d-%b-%Y")
     e = (end_date + datetime.timedelta(days=1)).strftime("%d-%b-%Y")
@@ -169,8 +157,8 @@ if st.button("📥 Fetch Emails"):
     st.session_state.batch_counter += 1
     batch = st.session_state.batch_counter
 
-    inbox_df = fetch_emails(START_DATE, END_DATE, "inbox", batch_id=batch)
-    spam_df = fetch_emails(START_DATE, END_DATE, "[Gmail]/Spam", batch_id=batch)
+    inbox_df = fetch_emails(START_DATE, END_DATE, "inbox", batch)
+    spam_df = fetch_emails(START_DATE, END_DATE, "[Gmail]/Spam", batch)
 
     df_new = pd.concat([inbox_df, spam_df], ignore_index=True)
     st.session_state.df = pd.concat([df_new, st.session_state.df], ignore_index=True)
@@ -180,24 +168,20 @@ if st.button("📥 Fetch Emails"):
 # ---------------- STYLING ----------------
 
 BATCH_COLORS = [
-    "#E3F2FD",  # light blue
-    "#FFF9C4",  # light yellow
-    "#E8F5E9",  # light green
-    "#F3E5F5",  # light lavender
+    "#E3F2FD",  # blue
+    "#FFF9C4",  # yellow
+    "#E8F5E9",  # green
+    "#F3E5F5",  # lavender
     "#FFE0B2",  # peach
-    "#E0F7FA",  # light cyan
-    "#FCE4EC",  # light pink
-    "#F1F8E9",  # lime
+    "#E0F7FA",  # cyan
 ]
 
 def highlight_rows(row):
-    # Failed auth → red
     if row["SPF"] != "pass" or row["DKIM"] != "pass" or row["DMARC"] != "pass":
-        return ["background-color: rgba(255, 0, 0, 0.2)"] * len(row)
+        return ["background-color: rgba(255,0,0,0.25)"] * len(row)
 
-    # Batch color
     batch_id = row["Batch_ID"]
-    if batch_id and batch_id > 0:
+    if batch_id:
         color = BATCH_COLORS[(batch_id - 1) % len(BATCH_COLORS)]
         return [f"background-color: {color}"] * len(row)
 
@@ -206,7 +190,6 @@ def highlight_rows(row):
 # ---------------- DISPLAY MAIN ----------------
 
 if not st.session_state.df.empty:
-
     inbox_cols = ["Subject", "Date", "From", "Domain",
                   "SPF", "DKIM", "DMARC",
                   "Type", "Mailbox", "Batch_ID"]
@@ -229,9 +212,11 @@ failed_df = st.session_state.df[
 ]
 
 if not failed_df.empty:
-    failed_cols = ["Subject", "Date", "From",
-                   "Domain", "SPF", "DKIM", "DMARC",
-                   "Mailbox"]
+    failed_cols = [
+        "Subject", "Date", "From",
+        "Domain", "SPF", "DKIM", "DMARC",
+        "Type", "Sub ID"
+    ]
     failed_display = failed_df[failed_cols].copy()
     failed_display.index += 1
 
@@ -252,13 +237,8 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
 
     if st.button("Run Extraction") and domain_input.strip():
 
-        selected_domains = [d.strip().lower() for d in domain_input.splitlines() if d.strip()]
+        selected_domains = [d.strip().lower() for d in domain_input.splitlines()]
         results = []
-
-        UNSUB_KEYWORDS = [
-            "preferences", "manage", "dropout",
-            "rmv", "checkout", "opt", "optout", "remove"
-        ]
 
         imap = imaplib.IMAP4_SSL("imap.gmail.com")
         imap.login(email_input, password_input)
@@ -283,15 +263,16 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
 
                 msg = email.message_from_bytes(part[1])
 
-                # -------- HEADER LIST-UNSUB --------
+                # ---- HEADER LIST-UNSUB ----
                 list_unsub = "-"
-                lu_header = msg.get("List-Unsubscribe")
-                if lu_header:
-                    urls = re.findall(r'https?://[^\s,<>]+', lu_header)
+                lu_headers = msg.get_all("List-Unsubscribe", [])
+                if lu_headers:
+                    combined = " ".join(lu_headers)
+                    urls = re.findall(r'https?://[^\s,<>]+', combined)
                     if urls:
                         list_unsub = urls[0]
 
-                # -------- BODY --------
+                # ---- BODY ----
                 body = ""
                 if msg.is_multipart():
                     for p in msg.walk():
@@ -302,7 +283,6 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
                 if not body:
                     continue
 
-                # Extract tags separately
                 a_links = re.findall(r'<a[^>]+href=["\'](https?://[^"\']+)["\']', body, re.I)
                 img_links = re.findall(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', body, re.I)
 
@@ -313,11 +293,19 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
                 logo = "-"
                 pixel = "-"
 
+                UNSUB_KEYWORDS = [
+                    "preferences", "manage", "dropout",
+                    "rmv", "checkout", "opt",
+                    "optout", "remove"
+                ]
+
                 for link in a_links:
                     low = link.lower()
                     if any(k in low for k in UNSUB_KEYWORDS):
-                        unsub = link
-                        break
+                        if "?" in low and list_unsub == "-":
+                            list_unsub = link
+                        else:
+                            unsub = link
 
                 for link in img_links:
                     low = link.lower()
