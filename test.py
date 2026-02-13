@@ -6,13 +6,13 @@ from email.utils import parsedate_to_datetime, parseaddr
 import datetime
 import re
 import pandas as pd
+import base64
 from urllib.parse import urlparse
 
 # ---------------- PAGE SETUP ----------------
-st.set_page_config(page_title="Email Auth + Tracking Intelligence", layout="wide")
-st.title("📧 Email Authentication & Tracking Intelligence")
+st.set_page_config(page_title="Email Auth Checker", layout="wide")
+st.title("📧 Email Authentication Report (SPF/DKIM/DMARC)")
 
-# ---------------- DATAFRAME STRUCTURE ----------------
 DF_COLS = [
     "Subject", "Date", "From",
     "SPF", "DKIM", "DMARC",
@@ -26,30 +26,25 @@ DF_COLS = [
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(columns=DF_COLS)
 
+if "tracking_df" not in st.session_state:
+    st.session_state.tracking_df = pd.DataFrame()
+
+if "last_uid" not in st.session_state:
+    st.session_state.last_uid = None
+
 if "batch_counter" not in st.session_state:
     st.session_state.batch_counter = 0
 
-# ---------------- SIDEBAR (DEEP EXTRACTION PANEL) ----------------
-st.sidebar.title("🔬 Deep Tracking Extraction")
+today = datetime.date.today()
 
-domain_input = st.sidebar.text_area(
-    "Paste tracking domains (one per line)",
-    height=200
-)
+# ---------------- EMAIL + PASSWORD ROW ----------------
+col1, col2 = st.columns(2)
 
-selected_domains = []
-if domain_input.strip():
-    selected_domains = [
-        d.strip().lower()
-        for d in domain_input.splitlines()
-        if d.strip()
-    ]
+with col1:
+    email_input = st.text_input("📧 Gmail Address")
 
-run_deep = st.sidebar.button("🚀 Extract Tracking For These Domains")
-
-# ---------------- INPUTS ----------------
-email_input = st.text_input("📧 Gmail Address")
-password_input = st.text_input("🔐 App Password", type="password")
+with col2:
+    password_input = st.text_input("🔐 App Password", type="password")
 
 if not email_input or not password_input:
     st.warning("Enter Gmail + App Password")
@@ -85,9 +80,9 @@ def get_domain_from_url(url):
     except:
         return ""
 
-# ---------------- HEADER PARSER ----------------
+# ---------------- PARSER ----------------
 
-def parse_header_email(msg, batch_id):
+def parse_email_message(msg, batch_id):
 
     raw_from = decode_mime_words(msg.get("From", ""))
     display_name, email_addr = parseaddr(raw_from)
@@ -111,12 +106,10 @@ def parse_header_email(msg, batch_id):
         "Logo": "-"
     }
 
-    # Extract domain
     match_auth = re.search(r'smtp.mailfrom=([\w\.-]+)', headers_str, re.I)
     if match_auth:
         data["Domain"] = match_auth.group(1).lower()
 
-    # SPF/DKIM/DMARC
     for key in ["spf", "dkim", "dmarc"]:
         m = re.search(fr'{key}=(\w+)', headers_str, re.I)
         if m:
@@ -124,9 +117,9 @@ def parse_header_email(msg, batch_id):
 
     return data
 
-# ---------------- FETCH HEADERS ----------------
+# ---------------- FETCH ----------------
 
-def fetch_headers(batch_id):
+def fetch_emails(batch_id):
 
     results = []
 
@@ -135,25 +128,27 @@ def fetch_headers(batch_id):
     imap.select("inbox")
 
     status, data = imap.search(None, "ALL")
-    ids = data[0].split()[-120:]  # last 120 emails
+    ids = data[0].split()
 
     for num in ids:
         status, msg_data = imap.fetch(num, '(BODY.PEEK[HEADER])')
         for response_part in msg_data:
             if isinstance(response_part, tuple):
                 msg = email.message_from_bytes(response_part[1])
-                results.append(parse_header_email(msg, batch_id))
+                results.append(parse_email_message(msg, batch_id))
 
     imap.logout()
     return pd.DataFrame(results, columns=DF_COLS)
 
 # ---------------- DEEP EXTRACTION ----------------
 
-def deep_extract_for_selected(df, selected_domains):
+def deep_extract(df, selected_domains):
 
     imap = imaplib.IMAP4_SSL("imap.gmail.com")
     imap.login(email_input, password_input)
     imap.select("inbox")
+
+    tracking_rows = []
 
     for idx, row in df.iterrows():
 
@@ -178,7 +173,6 @@ def deep_extract_for_selected(df, selected_domains):
 
                 headers_str = ''.join(f"{h}: {v}\n" for h, v in msg.items())
 
-                # Extract List-Unsubscribe
                 lu_match = re.search(r'List-Unsubscribe:.*', headers_str, re.I)
                 tracking_domain = ""
 
@@ -186,12 +180,11 @@ def deep_extract_for_selected(df, selected_domains):
                     lu_urls = re.findall(r'<([^>]+)>', lu_match.group(0))
                     for url in lu_urls:
                         if url.startswith("http"):
-                            df.at[idx, "List-Unsubscribe"] = url
                             tracking_domain = get_domain_from_url(url)
-                            df.at[idx, "Tracking Domain"] = tracking_domain
+                            row["Tracking Domain"] = tracking_domain
+                            row["List-Unsubscribe"] = url
                             break
 
-                # Extract HTML
                 body_html = ""
                 if msg.is_multipart():
                     for p in msg.walk():
@@ -205,42 +198,26 @@ def deep_extract_for_selected(df, selected_domains):
 
                     for link in tracking_links:
                         l = link.lower()
-
                         if "unsub" in l:
-                            df.at[idx, "Unsubscribe Link"] = link
+                            row["Unsubscribe Link"] = link
                         elif re.search(r'pixel|open|track|view', l):
-                            df.at[idx, "Open Pixel"] = link
+                            row["Open Pixel"] = link
                         elif re.search(r'\.(png|jpg|jpeg|gif|svg)$', l):
-                            df.at[idx, "Logo"] = link
+                            row["Logo"] = link
+
+                tracking_rows.append(row)
 
     imap.logout()
-    return df
+    return pd.DataFrame(tracking_rows)
 
 # ---------------- FETCH BUTTON ----------------
 
-if st.button("📥 Fetch 120 Emails"):
-
+if st.button("📥 Fetch Emails"):
     st.session_state.batch_counter += 1
-    batch_id = st.session_state.batch_counter
+    st.session_state.df = fetch_emails(st.session_state.batch_counter)
+    st.success("Emails fetched successfully.")
 
-    with st.spinner("Fetching headers..."):
-        st.session_state.df = fetch_headers(batch_id)
-
-    st.success("Header fetch complete.")
-
-# ---------------- RUN DEEP EXTRACTION ----------------
-
-if run_deep and selected_domains and not st.session_state.df.empty:
-
-    with st.spinner("Running deep tracking extraction..."):
-        st.session_state.df = deep_extract_for_selected(
-            st.session_state.df,
-            selected_domains
-        )
-
-    st.success("Tracking extraction completed.")
-
-# ---------------- DISPLAY ----------------
+# ---------------- DISPLAY MAIN TABLE ----------------
 
 if not st.session_state.df.empty:
 
@@ -250,7 +227,6 @@ if not st.session_state.df.empty:
     st.subheader("📬 Processed Emails")
     st.dataframe(display_df, use_container_width=True)
 
-    # Failed Auth Table (includes time)
     failed = display_df[
         (display_df["SPF"] != "pass") |
         (display_df["DKIM"] != "pass") |
@@ -260,3 +236,39 @@ if not st.session_state.df.empty:
     if not failed.empty:
         st.subheader("❌ Failed Auth Emails")
         st.dataframe(failed, use_container_width=True)
+
+# ---------------- DEEP TRACKING BOX (SAME PAGE) ----------------
+
+st.markdown("---")
+st.subheader("🔬 Deep Tracking Extraction")
+
+domain_input = st.text_area(
+    "Paste tracking domains (one per line)",
+    height=150
+)
+
+if st.button("🚀 Extract Tracking") and domain_input.strip() and not st.session_state.df.empty:
+
+    selected_domains = [
+        d.strip().lower()
+        for d in domain_input.splitlines()
+        if d.strip()
+    ]
+
+    with st.spinner("Extracting tracking details..."):
+        st.session_state.tracking_df = deep_extract(
+            st.session_state.df,
+            selected_domains
+        )
+
+    st.success("Tracking extraction complete.")
+
+# ---------------- TRACKING RESULT TABLE ----------------
+
+if not st.session_state.tracking_df.empty:
+
+    tracking_display = st.session_state.tracking_df.copy()
+    tracking_display.index = tracking_display.index + 1
+
+    st.subheader("📊 Tracking Extraction Results")
+    st.dataframe(tracking_display, use_container_width=True)
