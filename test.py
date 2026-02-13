@@ -13,7 +13,6 @@ import urllib.parse
 st.set_page_config(page_title="Email Auth Checker", layout="wide")
 st.title("📧 Email Authentication Report (SPF/DKIM/DMARC)")
 
-# ---------------- DATAFRAME COLUMNS ----------------
 DF_COLS = [
     "Subject", "Date", "From",
     "SPF", "DKIM", "DMARC",
@@ -37,7 +36,7 @@ today = datetime.date.today()
 if 'fetch_dates' not in st.session_state:
     st.session_state.fetch_dates = (today, today)
 
-# ---------------- EMAIL + PASSWORD + DATE ROW ----------------
+# ---------------- INPUT ROW ----------------
 with st.container():
     col1, col2, col3, col4 = st.columns([3, 3, 2, 1])
 
@@ -76,7 +75,6 @@ if not email_input or not password_input:
     st.stop()
 
 START_DATE, END_DATE = st.session_state.fetch_dates
-IS_SINGLE_DAY = START_DATE == END_DATE
 
 # ---------------- UTILITIES ----------------
 
@@ -171,12 +169,11 @@ def parse_email_message(msg, batch_id):
 
     return data
 
-# ---------------- FETCH FUNCTION ----------------
+# ---------------- FETCH ----------------
 
 def fetch_emails(start_date, end_date, mailbox="inbox", use_uid_since=False, last_uid=None, batch_id=0):
 
     results = []
-
     s = start_date.strftime("%d-%b-%Y")
     e = (end_date + datetime.timedelta(days=1)).strftime("%d-%b-%Y")
 
@@ -191,7 +188,6 @@ def fetch_emails(start_date, end_date, mailbox="inbox", use_uid_since=False, las
 
     status, data = imap.uid('search', None, criteria)
     uids = data[0].split()
-
     new_last = last_uid
 
     for uid in uids:
@@ -236,18 +232,9 @@ with colA:
 
         st.success(f"Batch #{batch} fetched. Total: {len(df_new)} emails.")
 
-with colB:
-    if st.button("🗑️ Fetch Spam Only"):
-        spam_df, _ = fetch_emails(
-            START_DATE, END_DATE, "[Gmail]/Spam",
-            False, None, 0
-        )
-        st.session_state.spam_df = pd.concat([spam_df, st.session_state.spam_df], ignore_index=True)
-
-# ---------------- DISPLAY MAIN TABLE ----------------
+# ---------------- DISPLAY MAIN ----------------
 
 if not st.session_state.df.empty:
-
     inbox_cols = ["Subject", "Date", "From", "Domain",
                   "SPF", "DKIM", "DMARC",
                   "Type", "Mailbox", "Batch_ID"]
@@ -259,7 +246,7 @@ if not st.session_state.df.empty:
     st.dataframe(display_df, use_container_width=True,
                  column_config={"Batch_ID": None})
 
-# ---------------- FAILED AUTH TABLE ----------------
+# ---------------- FAILED AUTH ----------------
 
 if not st.session_state.df.empty:
     failed_df = st.session_state.df[
@@ -272,13 +259,14 @@ if not st.session_state.df.empty:
         failed_cols = ["Subject", "Date", "From",
                        "Domain", "SPF", "DKIM", "DMARC",
                        "Type", "Sub ID", "Mailbox"]
+
         failed_display = failed_df[failed_cols].copy()
         failed_display.index += 1
 
         st.subheader("❌ Failed Auth Emails")
         st.dataframe(failed_display, use_container_width=True)
 
-# ---------------- OPTIONAL TRACKING TOOL ----------------
+# ---------------- TRACKING TOOL ----------------
 
 st.markdown("---")
 
@@ -288,7 +276,6 @@ if st.button("🔗 Extract Tracking Links"):
 if st.session_state.show_tracking_tool and not st.session_state.df.empty:
 
     st.subheader("🔬 Deep Tracking Extraction")
-
     domain_input = st.text_area("Paste domains (one per line)", height=120)
 
     if st.button("Run Extraction") and domain_input.strip():
@@ -318,63 +305,51 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
                     continue
 
                 msg = email.message_from_bytes(part[1])
-
                 headers_str = ''.join(f"{h}: {v}\n" for h, v in msg.items())
 
-                tracking_domain = "-"
-                list_unsub = "-"
-                unsub_link = "-"
-                open_pixel = "-"
-                logo = "-"
+                # Multi-line List-Unsubscribe capture
+                lu_match = re.search(r'List-Unsubscribe:(.*?)(\n\S|\Z)', headers_str, re.I | re.S)
 
-                # ---------------- STEP 1: Extract List-Unsubscribe ----------------
-                lu_match = re.search(r'List-Unsubscribe:.*', headers_str, re.I)
-
-                if lu_match:
-                    urls = re.findall(r'<([^>]+)>', lu_match.group(0))
-                    for u in urls:
-                        if u.startswith("http"):
-                            list_unsub = u
-                            tracking_domain = urllib.parse.urlparse(u).netloc.lower()
-                            break
-
-                # If no tracking domain found, skip
-                if tracking_domain == "-":
+                if not lu_match:
                     continue
 
-                # ---------------- STEP 2: Extract HTML ----------------
-                body_html = ""
+                lu_block = lu_match.group(1)
+                urls = re.findall(r'https?://[^\s,<>]+', lu_block)
 
+                if not urls:
+                    continue
+
+                list_unsub = urls[0]
+                tracking_domain = urllib.parse.urlparse(list_unsub).netloc.lower()
+
+                body = ""
                 if msg.is_multipart():
                     for p in msg.walk():
                         if p.get_content_type() == "text/html":
-                            body_html = p.get_payload(decode=True).decode(errors="ignore")
+                            body = p.get_payload(decode=True).decode(errors="ignore")
                             break
-                else:
-                    if msg.get_content_type() == "text/html":
-                        body_html = msg.get_payload(decode=True).decode(errors="ignore")
 
-                if not body_html:
-                    continue
+                if not body:
+                    try:
+                        body = msg.get_payload(decode=True).decode(errors="ignore")
+                    except:
+                        continue
 
-                # ---------------- STEP 3: Extract All Links ----------------
-                links = re.findall(r'https?://[^\s"\'<>]+', body_html)
-
-                # Keep only links containing tracking domain
+                links = re.findall(r'https?://[^\s"\'<>]+', body)
                 tracking_links = [l for l in links if tracking_domain in l]
 
-                # ---------------- STEP 4: Classify ----------------
-                for link in tracking_links:
-                    low = link.lower()
+                unsub = "-"
+                pixel = "-"
+                logo = "-"
 
+                for l in tracking_links:
+                    low = l.lower()
                     if re.search(r'unsub|opt.?out|remove', low):
-                        unsub_link = link
-
+                        unsub = l
                     elif re.search(r'pixel|open|track|view', low):
-                        open_pixel = link
-
+                        pixel = l
                     elif re.search(r'\.(png|jpg|jpeg|gif|svg)$', low):
-                        logo = link
+                        logo = l
 
                 results.append({
                     "Subject": row["Subject"],
@@ -383,8 +358,8 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
                     "Sender Domain": row["Domain"],
                     "Tracking Domain": tracking_domain,
                     "List-Unsubscribe": list_unsub,
-                    "Unsubscribe Link": unsub_link,
-                    "Open Pixel": open_pixel,
+                    "Unsubscribe Link": unsub,
+                    "Open Pixel": pixel,
                     "Logo": logo
                 })
 
