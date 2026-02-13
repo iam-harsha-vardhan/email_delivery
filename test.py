@@ -278,7 +278,7 @@ if not st.session_state.df.empty:
         st.subheader("❌ Failed Auth Emails")
         st.dataframe(failed_display, use_container_width=True)
 
-# ---------------- OPTIONAL LINK TOOL ----------------
+# ---------------- OPTIONAL TRACKING TOOL ----------------
 
 st.markdown("---")
 
@@ -293,7 +293,7 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
 
     if st.button("Run Extraction") and domain_input.strip():
 
-        domains = [d.strip().lower() for d in domain_input.splitlines() if d.strip()]
+        selected_domains = [d.strip().lower() for d in domain_input.splitlines() if d.strip()]
         results = []
 
         imap = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -302,7 +302,7 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
 
         for _, row in st.session_state.df.iterrows():
 
-            if row["Domain"] not in domains:
+            if row["Domain"] not in selected_domains:
                 continue
 
             msg_id = row["Message-ID"]
@@ -318,49 +318,73 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
                     continue
 
                 msg = email.message_from_bytes(part[1])
-                headers = ''.join(f"{h}: {v}\n" for h, v in msg.items())
 
-                tracking = row["Domain"]
+                headers_str = ''.join(f"{h}: {v}\n" for h, v in msg.items())
+
+                tracking_domain = "-"
                 list_unsub = "-"
-                unsub = "-"
-                pixel = "-"
+                unsub_link = "-"
+                open_pixel = "-"
                 logo = "-"
 
-                lu = re.search(r'List-Unsubscribe:.*', headers, re.I)
-                if lu:
-                    urls = re.findall(r'<([^>]+)>', lu.group(0))
+                # ---------------- STEP 1: Extract List-Unsubscribe ----------------
+                lu_match = re.search(r'List-Unsubscribe:.*', headers_str, re.I)
+
+                if lu_match:
+                    urls = re.findall(r'<([^>]+)>', lu_match.group(0))
                     for u in urls:
                         if u.startswith("http"):
                             list_unsub = u
+                            tracking_domain = urllib.parse.urlparse(u).netloc.lower()
                             break
 
-                body = ""
+                # If no tracking domain found, skip
+                if tracking_domain == "-":
+                    continue
+
+                # ---------------- STEP 2: Extract HTML ----------------
+                body_html = ""
+
                 if msg.is_multipart():
                     for p in msg.walk():
                         if p.get_content_type() == "text/html":
-                            body = p.get_payload(decode=True).decode(errors="ignore")
+                            body_html = p.get_payload(decode=True).decode(errors="ignore")
                             break
+                else:
+                    if msg.get_content_type() == "text/html":
+                        body_html = msg.get_payload(decode=True).decode(errors="ignore")
 
-                links = re.findall(r'https?://[^\s"\'<>]+', body)
-                tlinks = [l for l in links if tracking in l]
+                if not body_html:
+                    continue
 
-                for l in tlinks:
-                    low = l.lower()
-                    if "unsub" in low:
-                        unsub = l
-                    elif re.search(r'pixel|open|track', low):
-                        pixel = l
+                # ---------------- STEP 3: Extract All Links ----------------
+                links = re.findall(r'https?://[^\s"\'<>]+', body_html)
+
+                # Keep only links containing tracking domain
+                tracking_links = [l for l in links if tracking_domain in l]
+
+                # ---------------- STEP 4: Classify ----------------
+                for link in tracking_links:
+                    low = link.lower()
+
+                    if re.search(r'unsub|opt.?out|remove', low):
+                        unsub_link = link
+
+                    elif re.search(r'pixel|open|track|view', low):
+                        open_pixel = link
+
                     elif re.search(r'\.(png|jpg|jpeg|gif|svg)$', low):
-                        logo = l
+                        logo = link
 
                 results.append({
                     "Subject": row["Subject"],
                     "Date": row["Date"],
                     "From": row["From"],
-                    "Domain": row["Domain"],
+                    "Sender Domain": row["Domain"],
+                    "Tracking Domain": tracking_domain,
                     "List-Unsubscribe": list_unsub,
-                    "Unsubscribe Link": unsub,
-                    "Open Pixel": pixel,
+                    "Unsubscribe Link": unsub_link,
+                    "Open Pixel": open_pixel,
                     "Logo": logo
                 })
 
@@ -372,4 +396,4 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
             st.subheader("📊 Tracking Link Results")
             st.dataframe(df_links, use_container_width=True)
         else:
-            st.info("No matching links found.")
+            st.info("No tracking infrastructure detected for selected domains.")
