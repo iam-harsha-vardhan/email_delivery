@@ -205,36 +205,34 @@ def fetch_emails(start_date, end_date, mailbox="inbox", use_uid_since=False, las
     imap.logout()
     return pd.DataFrame(results, columns=DF_COLS), new_last
 
-# ---------------- FETCH BUTTONS ----------------
+# ---------------- FETCH BUTTON ----------------
 
-colA, colB = st.columns([1.5, 2])
+if st.button("📥 Fetch Emails"):
+    st.session_state.batch_counter += 1
+    batch = st.session_state.batch_counter
 
-with colA:
-    if st.button("📥 Fetch Emails"):
-        st.session_state.batch_counter += 1
-        batch = st.session_state.batch_counter
+    inbox_df, new_uid = fetch_emails(
+        START_DATE, END_DATE, "inbox",
+        st.session_state.last_uid is not None,
+        st.session_state.last_uid,
+        batch
+    )
 
-        inbox_df, new_uid = fetch_emails(
-            START_DATE, END_DATE, "inbox",
-            st.session_state.last_uid is not None,
-            st.session_state.last_uid,
-            batch
-        )
+    spam_df, _ = fetch_emails(
+        START_DATE, END_DATE, "[Gmail]/Spam",
+        False, None, batch
+    )
 
-        spam_df, _ = fetch_emails(
-            START_DATE, END_DATE, "[Gmail]/Spam",
-            False, None, batch
-        )
+    df_new = pd.concat([inbox_df, spam_df], ignore_index=True)
+    st.session_state.df = pd.concat([df_new, st.session_state.df], ignore_index=True)
+    st.session_state.last_uid = new_uid
 
-        df_new = pd.concat([inbox_df, spam_df], ignore_index=True)
-        st.session_state.df = pd.concat([df_new, st.session_state.df], ignore_index=True)
-        st.session_state.last_uid = new_uid
-
-        st.success(f"Batch #{batch} fetched. Total: {len(df_new)} emails.")
+    st.success(f"Batch #{batch} fetched. Total: {len(df_new)} emails.")
 
 # ---------------- DISPLAY MAIN ----------------
 
 if not st.session_state.df.empty:
+
     inbox_cols = ["Subject", "Date", "From", "Domain",
                   "SPF", "DKIM", "DMARC",
                   "Type", "Mailbox", "Batch_ID"]
@@ -266,7 +264,7 @@ if not st.session_state.df.empty:
         st.subheader("❌ Failed Auth Emails")
         st.dataframe(failed_display, use_container_width=True)
 
-# ---------------- OPTIONAL TRACKING TOOL ----------------
+# ---------------- TRACKING TOOL ----------------
 
 st.markdown("---")
 
@@ -276,13 +274,17 @@ if st.button("🔗 Extract Tracking Links"):
 if st.session_state.show_tracking_tool and not st.session_state.df.empty:
 
     st.subheader("🔬 Deep Tracking Extraction")
-
     domain_input = st.text_area("Paste domains (one per line)", height=120)
 
     if st.button("Run Extraction") and domain_input.strip():
 
         selected_domains = [d.strip().lower() for d in domain_input.splitlines() if d.strip()]
         results = []
+
+        UNSUB_KEYWORDS = [
+            "preferences", "rmv", "checkout",
+            "opt", "optout", "remove", "manage"
+        ]
 
         imap = imaplib.IMAP4_SSL("imap.gmail.com")
         imap.login(email_input, password_input)
@@ -306,80 +308,53 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
                     continue
 
                 msg = email.message_from_bytes(part[1])
-                headers_str = ''.join(f"{h}: {v}\n" for h, v in msg.items())
-
-                # ---------------- HEADER LEVEL (One-Click) ----------------
-
-                header_unsub = "-"
-                one_click = "No"
-
-                # Capture multi-line List-Unsubscribe
-                lu_match = re.search(r'List-Unsubscribe:(.*?)(\n\S|\Z)', headers_str, re.I | re.S)
-
-                if lu_match:
-                    lu_block = lu_match.group(1)
-                    urls = re.findall(r'https?://[^\s,<>]+', lu_block)
-
-                    for u in urls:
-                        if row["Domain"] in u.lower():
-                            header_unsub = u
-                            break
-
-                # Detect RFC One-Click
-                if "List-Unsubscribe-Post" in headers_str:
-                    one_click = "Yes"
-
-                # ---------------- BODY EXTRACTION ----------------
 
                 body = ""
-
                 if msg.is_multipart():
                     for p in msg.walk():
                         if p.get_content_type() == "text/html":
                             body = p.get_payload(decode=True).decode(errors="ignore")
                             break
-
-                if not body:
-                    try:
+                else:
+                    if msg.get_content_type() == "text/html":
                         body = msg.get_payload(decode=True).decode(errors="ignore")
-                    except:
-                        body = ""
 
                 if not body:
                     continue
 
                 links = re.findall(r'https?://[^\s"\'<>]+', body)
-
                 domain_links = [l for l in links if row["Domain"] in l.lower()]
 
-                body_unsub = "-"
+                list_unsub = "-"
+                unsub = "-"
                 logo = "-"
-                open_pixel = "-"
+                pixel = "-"
 
                 for link in domain_links:
                     low = link.lower()
 
-                    # Body Unsubscribe
-                    if "unsub" in low:
-                        body_unsub = link
+                    if "list-unsub" in low:
+                        list_unsub = link
 
-                    # Logo (image file)
-                    elif re.search(r'\.(jpg|jpeg|png|gif|svg)$', low):
+                    elif any(k in low for k in UNSUB_KEYWORDS):
+                        unsub = link
+
+                    elif re.search(r'\.(jpg|jpeg|png|gif|svg)', low):
                         logo = link
 
-                    # Everything else = open pixel / tracking
-                    else:
-                        open_pixel = link
+                remaining = [l for l in domain_links if l not in [list_unsub, unsub, logo]]
+
+                if remaining:
+                    pixel = remaining[0]
 
                 results.append({
                     "Subject": row["Subject"],
                     "Date": row["Date"],
                     "From": row["From"],
                     "Sender Domain": row["Domain"],
-                    "One-Click Supported": one_click,
-                    "Header List-Unsub": header_unsub,
-                    "Body Unsub Link": body_unsub,
-                    "Open Pixel": open_pixel,
+                    "List-Unsubscribe": list_unsub,
+                    "Unsubscribe Link": unsub,
+                    "Open Pixel": pixel,
                     "Logo": logo
                 })
 
@@ -391,4 +366,4 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
             st.subheader("📊 Tracking Link Results")
             st.dataframe(df_links, use_container_width=True)
         else:
-            st.info("No matching links found for selected domains.")
+            st.info("No matching domain links found.")
