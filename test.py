@@ -266,7 +266,7 @@ if not st.session_state.df.empty:
         st.subheader("❌ Failed Auth Emails")
         st.dataframe(failed_display, use_container_width=True)
 
-# ---------------- TRACKING TOOL ----------------
+# ---------------- OPTIONAL TRACKING TOOL ----------------
 
 st.markdown("---")
 
@@ -276,6 +276,7 @@ if st.button("🔗 Extract Tracking Links"):
 if st.session_state.show_tracking_tool and not st.session_state.df.empty:
 
     st.subheader("🔬 Deep Tracking Extraction")
+
     domain_input = st.text_area("Paste domains (one per line)", height=120)
 
     if st.button("Run Extraction") and domain_input.strip():
@@ -307,22 +308,31 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
                 msg = email.message_from_bytes(part[1])
                 headers_str = ''.join(f"{h}: {v}\n" for h, v in msg.items())
 
-                # Multi-line List-Unsubscribe capture
+                # ---------------- HEADER LEVEL (One-Click) ----------------
+
+                header_unsub = "-"
+                one_click = "No"
+
+                # Capture multi-line List-Unsubscribe
                 lu_match = re.search(r'List-Unsubscribe:(.*?)(\n\S|\Z)', headers_str, re.I | re.S)
 
-                if not lu_match:
-                    continue
+                if lu_match:
+                    lu_block = lu_match.group(1)
+                    urls = re.findall(r'https?://[^\s,<>]+', lu_block)
 
-                lu_block = lu_match.group(1)
-                urls = re.findall(r'https?://[^\s,<>]+', lu_block)
+                    for u in urls:
+                        if row["Domain"] in u.lower():
+                            header_unsub = u
+                            break
 
-                if not urls:
-                    continue
+                # Detect RFC One-Click
+                if "List-Unsubscribe-Post" in headers_str:
+                    one_click = "Yes"
 
-                list_unsub = urls[0]
-                tracking_domain = urllib.parse.urlparse(list_unsub).netloc.lower()
+                # ---------------- BODY EXTRACTION ----------------
 
                 body = ""
+
                 if msg.is_multipart():
                     for p in msg.walk():
                         if p.get_content_type() == "text/html":
@@ -333,33 +343,43 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
                     try:
                         body = msg.get_payload(decode=True).decode(errors="ignore")
                     except:
-                        continue
+                        body = ""
+
+                if not body:
+                    continue
 
                 links = re.findall(r'https?://[^\s"\'<>]+', body)
-                tracking_links = [l for l in links if tracking_domain in l]
 
-                unsub = "-"
-                pixel = "-"
+                domain_links = [l for l in links if row["Domain"] in l.lower()]
+
+                body_unsub = "-"
                 logo = "-"
+                open_pixel = "-"
 
-                for l in tracking_links:
-                    low = l.lower()
-                    if re.search(r'unsub|opt.?out|remove', low):
-                        unsub = l
-                    elif re.search(r'pixel|open|track|view', low):
-                        pixel = l
-                    elif re.search(r'\.(png|jpg|jpeg|gif|svg)$', low):
-                        logo = l
+                for link in domain_links:
+                    low = link.lower()
+
+                    # Body Unsubscribe
+                    if "unsub" in low:
+                        body_unsub = link
+
+                    # Logo (image file)
+                    elif re.search(r'\.(jpg|jpeg|png|gif|svg)$', low):
+                        logo = link
+
+                    # Everything else = open pixel / tracking
+                    else:
+                        open_pixel = link
 
                 results.append({
                     "Subject": row["Subject"],
                     "Date": row["Date"],
                     "From": row["From"],
                     "Sender Domain": row["Domain"],
-                    "Tracking Domain": tracking_domain,
-                    "List-Unsubscribe": list_unsub,
-                    "Unsubscribe Link": unsub,
-                    "Open Pixel": pixel,
+                    "One-Click Supported": one_click,
+                    "Header List-Unsub": header_unsub,
+                    "Body Unsub Link": body_unsub,
+                    "Open Pixel": open_pixel,
                     "Logo": logo
                 })
 
@@ -371,4 +391,4 @@ if st.session_state.show_tracking_tool and not st.session_state.df.empty:
             st.subheader("📊 Tracking Link Results")
             st.dataframe(df_links, use_container_width=True)
         else:
-            st.info("No tracking infrastructure detected for selected domains.")
+            st.info("No matching links found for selected domains.")
