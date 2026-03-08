@@ -1,4 +1,5 @@
-```python
+# app.py
+
 import streamlit as st
 import imaplib
 import email
@@ -9,211 +10,266 @@ import re
 import pandas as pd
 import pytz
 import base64
-from typing import List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------- Page ----------
+
 st.set_page_config(page_title="Dynamic Multi-Account Inbox Comparator", layout="wide")
 st.title("📧 Dynamic Multi-Account Inbox Comparator")
 
 # ---------- Config ----------
-UID_SCAN_LIMIT = 2000
+
 CHUNK_SIZE = 150
 
-# ---------- Session ----------
+# ---------- Session State ----------
+
 if "creds_df" not in st.session_state:
-    st.session_state.creds_df = pd.DataFrame([{"Email": "", "Password": ""}])
+st.session_state.creds_df = pd.DataFrame([{"Email": "", "Password": ""}])
 
 if "mailbox_data" not in st.session_state:
-    st.session_state.mailbox_data = {}
+st.session_state.mailbox_data = {}
 
 if "batch_id" not in st.session_state:
-    st.session_state.batch_id = 0
-
-# ---------- Mailbox Structure ----------
-def get_empty_mailbox_structure():
-    return {
-        "last_uid": None,
-        "df": pd.DataFrame(columns=[
-            "UID","Domain","Subject","From","Message-ID","Date",
-            "Date_dt","Sub ID","Type","SPF","DKIM","DMARC","fetch_batch"
-        ])
-    }
+st.session_state.batch_id = 0
 
 # ---------- Helpers ----------
+
+def get_empty_mailbox_structure():
+return {
+"last_uid": None,
+"df": pd.DataFrame(columns=[
+"UID","Domain","Subject","From","Message-ID",
+"Date","Date_dt","Sub ID","Type",
+"SPF","DKIM","DMARC","fetch_batch"
+])
+}
+
 def decode_mime_words(s):
-    if not s:
-        return ""
-    decoded = ""
-    for word, enc in decode_header(s):
-        if isinstance(word, bytes):
-            try:
-                decoded += word.decode(enc or "utf-8", errors="ignore")
-            except:
-                decoded += word.decode("utf-8", errors="ignore")
-        else:
-            decoded += word
-    return decoded.strip()
+if not s:
+return ""
+decoded = ""
+for word, enc in decode_header(s):
+if isinstance(word, bytes):
+try:
+decoded += word.decode(enc or "utf-8", errors="ignore")
+except:
+decoded += word.decode("utf-8", errors="ignore")
+else:
+decoded += word
+return decoded.strip()
 
-def extract_domain_from_address(address):
-    if not address:
-        return "-"
-    m = re.search(r'@([\w\.-]+)', address)
-    return m.group(1).lower() if m else "-"
+def extract_domain_from_address(addr):
+m = re.search(r'@([\w.-]+)', addr or "")
+return m.group(1).lower() if m else "-"
 
-def extract_auth_results_from_headers(msg):
-    auth = msg.get("Authentication-Results", "") or ""
-    spf = dkim = dmarc = "neutral"
+def extract_auth_results(msg):
+auth = msg.get("Authentication-Results", "")
+spf = dkim = dmarc = "neutral"
 
-    m = re.search(r'spf=(\w+)', auth, re.I)
-    if m: spf = m.group(1).lower()
+```
+m = re.search(r'spf=(\w+)', auth, re.I)
+if m: spf = m.group(1).lower()
 
-    m = re.search(r'dkim=(\w+)', auth, re.I)
-    if m: dkim = m.group(1).lower()
+m = re.search(r'dkim=(\w+)', auth, re.I)
+if m: dkim = m.group(1).lower()
 
-    m = re.search(r'dmarc=(\w+)', auth, re.I)
-    if m: dmarc = m.group(1).lower()
+m = re.search(r'dmarc=(\w+)', auth, re.I)
+if m: dmarc = m.group(1).lower()
 
-    return spf, dkim, dmarc
+return spf, dkim, dmarc
+```
 
-ID_RE = re.compile(r'\b(GRM-[A-Za-z0-9\-]+|GMFP-[A-Za-z0-9\-]+|GTC-[A-Za-z0-9\-]+|GRTC-[A-Za-z0-9\-]+)\b', re.I)
+ID_RE = re.compile(r'\b(GRM-[A-Za-z0-9-]+|GMFP-[A-Za-z0-9-]+|GTC-[A-Za-z0-9-]+|GRTC-[A-Za-z0-9-]+)\b', re.I)
 
-def map_id_to_type(sub_id):
-    if not sub_id: return "-"
-    s=sub_id.lower()
-    if s.startswith("grm"): return "FPR"
-    if s.startswith("gmfp"): return "FP"
-    if s.startswith("gtc"): return "FPTC"
-    if s.startswith("grtc"): return "FPRTC"
-    return "-"
+def extract_subid(msg):
 
-def find_subid_in_text(txt):
-    if not txt:
-        return None
-    m=ID_RE.search(txt)
-    return m.group(1) if m else None
+```
+msgid = msg.get("Message-ID","")
 
-def format_date_to_ist_string(raw_date):
-    if not raw_date:
-        return "-", None
+m = ID_RE.search(msgid)
+if m:
+    return m.group(1)
 
-    try:
-        dt = parsedate_to_datetime(raw_date)
-    except:
-        return raw_date, None
+for part in msg.walk():
 
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    if part.get_content_type() in ["text/plain","text/html"]:
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
 
-    ist = pytz.timezone("Asia/Kolkata")
-    dt_ist = dt.astimezone(ist)
-    return dt_ist.strftime("%d-%b-%Y %I:%M %p"), dt_ist.replace(tzinfo=None)
+        try:
+            text = payload.decode("utf-8","ignore")
+        except:
+            continue
 
-def extract_subid_from_msg(msg):
+        m = ID_RE.search(text)
+        if m:
+            return m.group(1)
 
-    msgid = msg.get("Message-ID","")
+return "-"
+```
 
-    tokens = re.split(r'[_\s]+', msgid)
+def format_date(raw):
 
-    for t in tokens:
-        s = find_subid_in_text(t)
-        if s:
-            return s, map_id_to_type(s)
+```
+if not raw:
+    return "-",None
 
-    for h,v in msg.items():
-        s=find_subid_in_text(str(v))
-        if s:
-            return s,map_id_to_type(s)
+try:
+    dt = parsedate_to_datetime(raw)
+except:
+    return raw,None
 
-    return None,"-"
+if dt.tzinfo is None:
+    dt = dt.replace(tzinfo=datetime.timezone.utc)
+
+ist = pytz.timezone("Asia/Kolkata")
+dt = dt.astimezone(ist)
+return dt.strftime("%d-%b-%Y %I:%M %p"), dt.replace(tzinfo=None)
+```
 
 # ---------- UIDNEXT ----------
+
 def get_uidnext(imap):
-    try:
-        status, data = imap.status("INBOX","(UIDNEXT)")
-        if status=="OK":
-            txt=data[0].decode()
-            m=re.search(r'UIDNEXT (\d+)',txt)
-            if m:
-                return int(m.group(1))
-    except:
-        pass
-    return None
 
-# ---------- Fetch ----------
-def fetch_inbox_emails_single(email_addr,password,last_uid=None,fetch_n=None,fetch_unit="emails"):
+```
+try:
+    status,data = imap.status("INBOX","(UIDNEXT)")
+    if status == "OK":
+        txt = data[0].decode()
+        m = re.search(r'UIDNEXT (\d+)',txt)
+        if m:
+            return int(m.group(1))
+except:
+    pass
 
-    results=[]
-    new_last_uid=last_uid
+return None
+```
 
-    imap=imaplib.IMAP4_SSL("imap.gmail.com")
+# ---------- Fetch Function ----------
+
+def fetch_inbox(email_addr,password,last_uid=None,fetch_n=None,fetch_unit="emails"):
+
+```
+results=[]
+new_last_uid = last_uid
+
+try:
+
+    imap = imaplib.IMAP4_SSL("imap.gmail.com")
     imap.login(email_addr,password)
     imap.select("INBOX")
 
     uids=[]
 
-    if last_uid:
+    # ---------- Incremental using UIDNEXT ----------
 
-        uidnext=get_uidnext(imap)
+    if fetch_unit=="incremental":
 
-        if uidnext:
-            start=int(last_uid)+1
-            end=uidnext-1
+        uidnext = get_uidnext(imap)
+
+        if last_uid and uidnext:
+
+            start = int(last_uid)+1
+            end = uidnext-1
 
             if start<=end:
 
-                status,data=imap.uid("search",None,f"UID {start}:{end}")
+                status,data = imap.uid("search",None,f"UID {start}:{end}")
 
                 if status=="OK" and data and data[0]:
                     uids=data[0].split()
 
-    if fetch_unit=="emails" and fetch_n:
+    # ---------- Fetch Last N Emails ----------
 
-        status,data=imap.uid("search",None,"ALL")
+    elif fetch_unit=="emails":
+
+        status,data = imap.uid("search",None,"ALL")
 
         if status=="OK" and data and data[0]:
-            all_uids=data[0].split()
-            uids=all_uids[-int(fetch_n):]
 
-    if not uids:
-        imap.logout()
-        return pd.DataFrame(results),new_last_uid
+            all_uids=data[0].split()
+            uids = all_uids[-int(fetch_n):]
+
+
+    # ---------- Fetch Last N Minutes/Hours ----------
+
+    else:
+
+        ist=pytz.timezone("Asia/Kolkata")
+        now=datetime.datetime.now(ist)
+
+        if fetch_unit=="minutes":
+            cutoff = now-datetime.timedelta(minutes=int(fetch_n))
+        else:
+            cutoff = now-datetime.timedelta(hours=int(fetch_n))
+
+        status,data = imap.uid("search",None,"ALL")
+
+        if status=="OK" and data and data[0]:
+
+            all_uids=data[0].split()
+
+            for uid in all_uids[::-1]:
+
+                res,msgdata = imap.uid("fetch",uid,"(BODY.PEEK[HEADER.FIELDS (DATE)])")
+
+                if res!="OK":
+                    continue
+
+                raw = msgdata[0][1].decode()
+
+                m=re.search(r'Date:\s*(.+)',raw)
+
+                if not m:
+                    continue
+
+                _,dt = format_date(m.group(1))
+
+                if dt and dt>=cutoff.replace(tzinfo=None):
+                    uids.append(uid)
+                else:
+                    break
+
+
+    # ---------- Fetch Headers ----------
 
     for i in range(0,len(uids),CHUNK_SIZE):
 
         chunk=uids[i:i+CHUNK_SIZE]
-        uid_seq=b",".join(chunk)
+        seq=b",".join(chunk)
 
-        res,data=imap.uid("fetch",uid_seq,"(BODY.PEEK[HEADER])")
+        res,data = imap.uid("fetch",seq,"(BODY.PEEK[HEADER])")
+
+        if res!="OK":
+            continue
 
         for part in data:
 
             if not isinstance(part,tuple):
                 continue
 
-            msg=email.message_from_bytes(part[1])
-
-            meta=part[0].decode("utf-8","ignore")
-
-            m=re.search(r'UID\s+(\d+)',meta)
+            meta = part[0].decode(errors="ignore")
+            m=re.search(r'UID (\d+)',meta)
 
             if not m:
                 continue
 
             uid=m.group(1)
 
+            msg=email.message_from_bytes(part[1])
+
             subject=decode_mime_words(msg.get("Subject",""))
             from_h=decode_mime_words(msg.get("From",""))
 
             domain=extract_domain_from_address(from_h)
 
-            spf,dkim,dmarc=extract_auth_results_from_headers(msg)
+            spf,dkim,dmarc = extract_auth_results(msg)
 
-            subid,typ=extract_subid_from_msg(msg)
+            subid = extract_subid(msg)
 
-            raw_date=msg.get("Date","")
-
-            formatted,dt=format_date_to_ist_string(raw_date)
+            date_raw = msg.get("Date","")
+            date_str,date_dt = format_date(date_raw)
 
             results.append({
                 "UID":uid,
@@ -221,10 +277,10 @@ def fetch_inbox_emails_single(email_addr,password,last_uid=None,fetch_n=None,fet
                 "Subject":subject,
                 "From":from_h,
                 "Message-ID":msg.get("Message-ID",""),
-                "Date":formatted,
-                "Date_dt":dt,
-                "Sub ID":subid or "-",
-                "Type":typ,
+                "Date":date_str,
+                "Date_dt":date_dt,
+                "Sub ID":subid,
+                "Type":"-",
                 "SPF":spf,
                 "DKIM":dkim,
                 "DMARC":dmarc
@@ -235,132 +291,160 @@ def fetch_inbox_emails_single(email_addr,password,last_uid=None,fetch_n=None,fet
 
     imap.logout()
 
-    return pd.DataFrame(results),new_last_uid
+except Exception as e:
+    st.error(f"{email_addr} error: {e}")
 
-# ---------- Parallel Fetch ----------
+return pd.DataFrame(results), new_last_uid
+```
+
+# ---------- Fetch Controller ----------
+
 def process_fetch(fetch_type,fetch_n=None,fetch_unit="emails"):
 
-    st.session_state.batch_id+=1
-    batch=st.session_state.batch_id
+```
+st.session_state.batch_id += 1
+batch_id = st.session_state.batch_id
 
-    accounts=[]
+accounts=[]
 
-    for _,r in st.session_state.creds_df.iterrows():
+for _,r in st.session_state.creds_df.iterrows():
 
-        e=r.get("Email","").strip()
-        p=r.get("Password","").strip()
+    email_addr=r.get("Email","").strip()
+    pwd=r.get("Password","").strip()
 
-        if not e or not p:
-            continue
+    if email_addr and pwd:
 
-        if e not in st.session_state.mailbox_data:
-            st.session_state.mailbox_data[e]=get_empty_mailbox_structure()
+        if email_addr not in st.session_state.mailbox_data:
+            st.session_state.mailbox_data[email_addr]=get_empty_mailbox_structure()
 
-        accounts.append((e,p))
+        accounts.append((email_addr,pwd))
 
-    def worker(e,p):
+def worker(acc):
 
-        mailbox=st.session_state.mailbox_data[e]
+    email_addr,pwd = acc
 
-        df_new,new_uid=fetch_inbox_emails_single(
-            e,p,
-            last_uid=mailbox.get("last_uid"),
-            fetch_n=fetch_n,
-            fetch_unit=fetch_unit
-        )
+    mailbox = st.session_state.mailbox_data[email_addr]
 
-        return e,df_new,new_uid
+    df,new_uid = fetch_inbox(
+        email_addr,
+        pwd,
+        mailbox["last_uid"],
+        fetch_n,
+        fetch_unit
+    )
 
-    with ThreadPoolExecutor(max_workers=len(accounts)) as executor:
+    return email_addr,df,new_uid
 
-        futures=[executor.submit(worker,a,b) for a,b in accounts]
+with ThreadPoolExecutor(max_workers=len(accounts)) as exe:
 
-        for future in as_completed(futures):
+    futures=[exe.submit(worker,a) for a in accounts]
 
-            e,df_new,new_uid=future.result()
+    for f in as_completed(futures):
 
-            mailbox=st.session_state.mailbox_data[e]
+        email_addr,df,new_uid=f.result()
 
-            if not df_new.empty:
+        mailbox=st.session_state.mailbox_data[email_addr]
 
-                df_new["fetch_batch"]=batch
+        if not df.empty:
 
-                mailbox["df"]=pd.concat(
-                    [mailbox["df"],df_new],
-                    ignore_index=True
-                ).drop_duplicates(subset=["UID"],keep="last")
+            df["fetch_batch"]=batch_id
 
-                try:
-                    mailbox["last_uid"]=str(mailbox["df"]["UID"].astype(int).max())
-                except:
-                    pass
+            mailbox["df"]=pd.concat(
+                [mailbox["df"],df],
+                ignore_index=True
+            ).drop_duplicates(subset=["UID"],keep="last")
 
-# ---------- Row Styling ----------
-def highlight_new_rows(row):
+            try:
+                mailbox["last_uid"]=str(mailbox["df"]["UID"].astype(int).max())
+            except:
+                pass
+```
 
-    if row.get("fetch_batch")==st.session_state.batch_id:
-        return ["background-color:#90EE90"]*len(row)
+# ---------- Row Coloring ----------
 
-    return [""]*len(row)
+def highlight_rows(row):
 
-# ---------- Credentials ----------
-st.markdown("### 📋 Account Credentials")
+```
+if row.get("fetch_batch")==st.session_state.batch_id:
+    return ["background-color:#90EE90"]*len(row)
 
-edited=st.data_editor(
-    st.session_state.creds_df,
-    num_rows="dynamic",
-    use_container_width=True,
-    hide_index=True
+return [""]*len(row)
+```
+
+# ---------- Credentials UI ----------
+
+st.markdown("### 📋 Accounts")
+
+edited = st.data_editor(
+st.session_state.creds_df,
+num_rows="dynamic",
+use_container_width=True,
+hide_index=True
 )
 
 st.session_state.creds_df=edited
 
 # ---------- Controls ----------
-col1,col2=st.columns(2)
-
-with col1:
-    if st.button("🔄 Fetch New"):
-        process_fetch("incremental")
-        st.success("Fetched new emails")
-
-with col2:
-
-    n=st.number_input("N",1,1000,100)
-
-    if st.button("📥 Fetch Last N Emails"):
-        process_fetch("last_n",n,"emails")
-        st.success("Fetched last N")
 
 st.markdown("---")
 
-# ---------- Table ----------
-rows=[]
+col1,col2,col3 = st.columns([1,2,1])
 
-for acc,data in st.session_state.mailbox_data.items():
+with col1:
 
-    df=data["df"]
+```
+if st.button("🔄 Fetch New"):
 
-    for _,r in df.iterrows():
+    process_fetch("incremental",None,"incremental")
+    st.success("Incremental fetch done")
+```
 
-        row=r.to_dict()
+with col2:
 
-        row["Account"]=acc.split("@")[0]
+```
+n = st.number_input("N",1,500,100)
 
-        rows.append(row)
+unit = st.selectbox(
+    "Unit",
+    ["emails","minutes","hours"]
+)
 
-if rows:
+if st.button("📥 Fetch Last N"):
 
-    df=pd.DataFrame(rows)
+    process_fetch("last",n,unit)
+    st.success("Fetched")
+```
 
-    df=df.sort_values("Date_dt",ascending=False)
+with col3:
+
+```
+if st.button("🗑 Clear"):
+
+    st.session_state.mailbox_data={}
+    st.rerun()
+```
+
+st.markdown("---")
+
+# ---------- Raw Inbox Tables ----------
+
+for email_addr,data in st.session_state.mailbox_data.items():
+
+```
+st.subheader(email_addr)
+
+df=data["df"]
+
+if not df.empty:
+
+    show=df.sort_values(
+        ["fetch_batch","Date_dt"],
+        ascending=[False,False]
+    )
 
     st.dataframe(
-        df.style.apply(highlight_new_rows,axis=1),
+        show.style.apply(highlight_rows,axis=1),
         use_container_width=True,
         hide_index=True
     )
-
-else:
-
-    st.info("No emails yet")
 ```
