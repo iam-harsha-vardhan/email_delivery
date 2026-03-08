@@ -261,7 +261,6 @@ def format_date_to_ist_string(raw_date):
     formatted=dt_ist.strftime("%d-%b-%Y %I:%M %p")
 
     return formatted,naive
-
 def extract_subid_from_msg(msg):
 
     msg_id_raw = decode_mime_words(
