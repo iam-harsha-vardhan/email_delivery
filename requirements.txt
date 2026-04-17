@@ -9,3 +9,4 @@ pandas
 joblib
 requests
 openpyxl
+dnspython
