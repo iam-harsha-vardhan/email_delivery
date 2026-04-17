@@ -1,8 +1,6 @@
 # Gmail Show Original Simulator
 
-## app.py
 
-```python
 import streamlit as st
 import dns.resolver
 import socket
@@ -147,19 +145,4 @@ if st.button('Run Simulation'):
         if do_spf: st.code(sample.get('SPF',''))
         if do_dkim: st.code(sample.get('DKIM',''))
         if do_dmarc: st.code('DMARC: ' + sample.get('DMARC',''))
-```
 
-## requirements.txt
-
-```txt
-streamlit
-pandas
-dnspython
-```
-
-## Run
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
