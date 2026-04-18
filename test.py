@@ -1,148 +1,243 @@
-# Gmail Show Original Simulator
-
+# app.py
 
 import streamlit as st
 import dns.resolver
 import socket
 import ipaddress
 import pandas as pd
-from typing import List
+import re
 
-st.set_page_config(page_title='Gmail Show Original Simulator', layout='wide')
+st.set_page_config(
+    page_title="Email Preflight Checker",
+    page_icon="📩",
+    layout="wide"
+)
 
-# ---------- Helpers ----------
-def get_txt(domain):
+# -------------------------
+# Helpers
+# -------------------------
+
+def get_txt_records(domain):
     try:
-        return [b''.join(r.strings).decode() for r in dns.resolver.resolve(domain, 'TXT')]
-    except Exception:
+        answers = dns.resolver.resolve(domain, "TXT")
+        records = []
+        for r in answers:
+            txt = b"".join(r.strings).decode()
+            records.append(txt)
+        return records
+    except:
         return []
 
 
-def get_a_records(domain):
-    try:
-        return [r.to_text() for r in dns.resolver.resolve(domain, 'A')]
-    except Exception:
-        return []
-
-
-def spf_record(domain):
-    for t in get_txt(domain):
-        if t.lower().startswith('v=spf1'):
-            return t
+def get_spf_record(domain):
+    txts = get_txt_records(domain)
+    for record in txts:
+        if record.lower().startswith("v=spf1"):
+            return record
     return None
 
 
-def ip_in_spf(ip, spf):
-    if not spf:
+def ip_authorized_in_spf(ip, spf_record):
+    if not spf_record:
         return False
-    parts = spf.split()
-    for p in parts:
-        if p.startswith('ip4:'):
-            net = p.replace('ip4:', '')
+
+    parts = spf_record.split()
+
+    for item in parts:
+        if item.startswith("ip4:"):
+            net = item.replace("ip4:", "").strip()
             try:
-                if '/' in net:
+                if "/" in net:
                     if ipaddress.ip_address(ip) in ipaddress.ip_network(net, strict=False):
                         return True
-                elif ip == net:
-                    return True
-            except Exception:
+                else:
+                    if ip == net:
+                        return True
+            except:
                 pass
+
     return False
 
 
-def dmarc_record(domain):
-    vals = get_txt(f'_dmarc.{domain}')
-    for v in vals:
-        if v.lower().startswith('v=dmarc1'):
-            return v
-    return None
-
-
-def dkim_exists(selector, domain):
-    vals = get_txt(f'{selector}._domainkey.{domain}')
-    return any('p=' in v for v in vals)
-
-
-def rdns(ip):
+def get_dmarc_record(domain):
     try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
+        txts = get_txt_records(f"_dmarc.{domain}")
+        for t in txts:
+            if t.lower().startswith("v=dmarc1"):
+                return t
+        return None
+    except:
         return None
 
 
-def fcrdns(ip):
-    host = rdns(ip)
+def parse_domain(email_or_domain):
+    if "@" in email_or_domain:
+        return email_or_domain.split("@")[-1].strip()
+    return email_or_domain.strip()
+
+
+def get_base_domain(domain):
+    parts = domain.split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return domain
+
+
+def check_dkim_selector(selector, domain):
+    try:
+        host = f"{selector}._domainkey.{domain}"
+        txts = get_txt_records(host)
+        for t in txts:
+            if "p=" in t:
+                return True
+        return False
+    except:
+        return False
+
+
+def reverse_dns(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except:
+        return None
+
+
+def forward_confirm(ip):
+    host = reverse_dns(ip)
+
     if not host:
         return False, None
+
     try:
         ips = socket.gethostbyname_ex(host)[2]
-        return ip in ips, host
-    except Exception:
+        if ip in ips:
+            return True, host
+        return False, host
+    except:
         return False, host
 
 
-def base_domain(v):
-    parts = v.split('.')
-    if len(parts) >= 2:
-        return '.'.join(parts[-2:])
-    return v
+# -------------------------
+# UI
+# -------------------------
 
-# ---------- UI ----------
-st.title('📩 Gmail Show Original Simulator')
+st.title("📩 Email Preflight Checker")
+st.caption("Checks SPF, DKIM, DMARC and FCrDNS for outbound sending IPs")
 
-with st.sidebar:
-    st.header('Checks')
-    do_spf = st.checkbox('SPF', True)
-    do_dkim = st.checkbox('DKIM', True)
-    do_dmarc = st.checkbox('DMARC', True)
-    do_fcrdns = st.checkbox('FCrDNS / rDNS', False)
+col1, col2 = st.columns(2)
 
-main_domain = st.text_input('Main Domain', 'demo.com')
-aliases = st.text_area('Alias / Subdomains (one per line)', 'updates.demo.com\nmail.demo.com')
-ips_text = st.text_area('Existing IPs (optional, one per line)', '')
-selectors = st.text_input('DKIM Selectors (comma separated)', 'pmta')
-from_email = st.text_input('From Email', 'news@demo.com')
-return_path = st.text_input('Return-Path Domain', 'bounce.demo.com')
-dkim_d = st.text_input('DKIM d= Domain', 'demo.com')
+with col1:
+    domain = st.text_input("Main Domain", "loanpathwaynow.com")
+    selector = st.text_input("DKIM Selector", "pat084")
+    from_email = st.text_input("From Email", "insights@loanpathwaynow.com")
 
-if st.button('Run Simulation'):
-    rows = []
-    assets = [main_domain] + [x.strip() for x in aliases.splitlines() if x.strip()]
-    manual_ips = [x.strip() for x in ips_text.splitlines() if x.strip()]
-    selectors_list = [x.strip() for x in selectors.split(',') if x.strip()]
+with col2:
+    return_path = st.text_input("Return-Path", "insights@loanpathwaynow.com")
+    ips_raw = st.text_area(
+        "Outbound IPs (comma or line separated)",
+        "194.34.237.62\n194.34.237.63"
+    )
 
-    for asset in assets:
-        ips = manual_ips if manual_ips else get_a_records(asset)
-        if not ips:
-            ips = ['No A record']
-        for ip in ips:
-            row = {'Asset': asset, 'IP': ip}
-            if do_spf:
-                spf = spf_record(base_domain(return_path)) or spf_record(asset) or spf_record(main_domain)
-                if ip != 'No A record' and ip_in_spf(ip, spf):
-                    row['SPF'] = f'PASS with IP {ip}'
-                else:
-                    row['SPF'] = 'FAIL'
-            if do_dkim:
-                passed = any(dkim_exists(s, dkim_d) for s in selectors_list)
-                row['DKIM'] = f"PASS with domain {dkim_d}" if passed else 'FAIL'
-            if do_dmarc:
-                frm = from_email.split('@')[-1]
-                aligned = base_domain(frm) == base_domain(dkim_d) or base_domain(frm) == base_domain(return_path)
-                row['DMARC'] = 'PASS' if dmarc_record(base_domain(frm)) and aligned else 'FAIL'
-            if do_fcrdns and ip != 'No A record':
-                ok, host = fcrdns(ip)
-                row['FCrDNS'] = 'PASS' if ok else 'FAIL'
-                row['PTR'] = host or 'No PTR'
-            rows.append(row)
+run = st.button("Run Preflight Check", use_container_width=True)
 
-    df = pd.DataFrame(rows)
+# -------------------------
+# Run
+# -------------------------
+
+if run:
+
+    ip_list = re.split(r"[,\n]+", ips_raw)
+    ip_list = [x.strip() for x in ip_list if x.strip()]
+
+    results = []
+
+    # SPF
+    spf = get_spf_record(domain)
+
+    # DKIM
+    dkim_ok = check_dkim_selector(selector, domain)
+
+    # DMARC
+    dmarc = get_dmarc_record(domain)
+
+    from_domain = parse_domain(from_email)
+    rp_domain = parse_domain(return_path)
+
+    dmarc_alignment = (
+        get_base_domain(from_domain) == get_base_domain(domain)
+        or get_base_domain(rp_domain) == get_base_domain(domain)
+    )
+
+    # Per IP checks
+    for ip in ip_list:
+
+        row = {"IP": ip}
+
+        # SPF
+        if spf and ip_authorized_in_spf(ip, spf):
+            row["SPF"] = f"PASS with IP {ip}"
+        else:
+            row["SPF"] = "FAIL"
+
+        # DKIM
+        row["DKIM"] = f"PASS with domain {domain}" if dkim_ok else "FAIL"
+
+        # DMARC
+        row["DMARC"] = "PASS" if dmarc and dmarc_alignment else "FAIL"
+
+        # FCrDNS
+        ok, host = forward_confirm(ip)
+        row["FCrDNS"] = "PASS" if ok else "FAIL"
+        row["PTR Hostname"] = host if host else "No PTR"
+
+        results.append(row)
+
+    df = pd.DataFrame(results)
+
+    # -------------------------
+    # Dashboard Cards
+    # -------------------------
+
+    st.subheader("Summary")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    all_spf = all("PASS" in x for x in df["SPF"])
+    all_dkim = all("PASS" in x for x in df["DKIM"])
+    all_dmarc = all("PASS" in x for x in df["DMARC"])
+    all_rdns = all("PASS" in x for x in df["FCrDNS"])
+
+    c1.metric("SPF", "PASS" if all_spf else "FAIL")
+    c2.metric("DKIM", "PASS" if all_dkim else "FAIL")
+    c3.metric("DMARC", "PASS" if all_dmarc else "FAIL")
+    c4.metric("FCrDNS", "PASS" if all_rdns else "FAIL")
+
+    # -------------------------
+    # Gmail Style Output
+    # -------------------------
+
+    st.subheader("Gmail Show Original Preview")
+
+    first = df.iloc[0]
+
+    st.code(first["SPF"])
+    st.code(first["DKIM"])
+    st.code("DMARC: " + first["DMARC"])
+
+    # -------------------------
+    # Table
+    # -------------------------
+
+    st.subheader("Detailed Results")
     st.dataframe(df, use_container_width=True)
 
-    st.subheader('Gmail Show Original Preview')
-    if not df.empty:
-        sample = df.iloc[0].to_dict()
-        if do_spf: st.code(sample.get('SPF',''))
-        if do_dkim: st.code(sample.get('DKIM',''))
-        if do_dmarc: st.code('DMARC: ' + sample.get('DMARC',''))
+    # -------------------------
+    # Final Verdict
+    # -------------------------
 
+    st.subheader("Launch Readiness")
+
+    if all_spf and all_dkim and all_dmarc and all_rdns:
+        st.success("✅ READY FOR FIRST HIT")
+    else:
+        st.error("❌ NOT READY FOR FIRST HIT")
