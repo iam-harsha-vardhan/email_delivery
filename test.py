@@ -1,351 +1,326 @@
 # app.py
+# Bulk Email Preflight Checker
+# SPF / DKIM / DMARC / FCrDNS
+# Single + Bulk CSV Upload
 
 import streamlit as st
+import pandas as pd
 import dns.resolver
 import socket
 import ipaddress
-import pandas as pd
 import re
+from io import StringIO
 
-# ---------------------------------------------------
-# Page Config
-# ---------------------------------------------------
+# -------------------------------------------------
+# PAGE
+# -------------------------------------------------
 
 st.set_page_config(
-    page_title="Email Preflight Checker",
+    page_title="Bulk Email Preflight Checker",
     page_icon="📩",
     layout="wide"
 )
 
-# ---------------------------------------------------
-# Custom CSS
-# ---------------------------------------------------
+# -------------------------------------------------
+# CSS
+# -------------------------------------------------
 
 st.markdown("""
 <style>
-.main {
-    padding-top: 20px;
+.main {padding-top:15px;}
+div[data-testid="metric-container"]{
+background:#111827;
+border:1px solid #374151;
+padding:14px;
+border-radius:14px;
 }
-div[data-testid="metric-container"] {
-    background: #111827;
-    border: 1px solid #374151;
-    padding: 15px;
-    border-radius: 14px;
-}
-.stButton button {
-    width: 100%;
-    border-radius: 12px;
-    height: 48px;
-    font-size: 16px;
-    font-weight: 600;
-}
-textarea, input {
-    border-radius: 10px !important;
+.stButton button{
+width:100%;
+height:46px;
+border-radius:12px;
+font-weight:700;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------------------------------------
-# DNS Helpers
-# ---------------------------------------------------
+# -------------------------------------------------
+# HELPERS
+# -------------------------------------------------
 
-def get_txt_records(domain):
+def txt_records(name):
     try:
-        answers = dns.resolver.resolve(domain, "TXT")
-        output = []
-        for r in answers:
+        ans = dns.resolver.resolve(name, "TXT")
+        out = []
+        for r in ans:
             try:
-                output.append(b"".join(r.strings).decode())
+                out.append(b"".join(r.strings).decode())
             except:
-                output.append(str(r))
-        return output
+                out.append(str(r))
+        return out
     except:
         return []
 
-
-def get_spf_record(domain):
-    txts = get_txt_records(domain)
-    for item in txts:
-        if item.lower().startswith("v=spf1"):
-            return item
+def get_spf(domain):
+    for x in txt_records(domain):
+        if x.lower().startswith("v=spf1"):
+            return x
     return None
 
+def get_dmarc(domain):
+    for x in txt_records(f"_dmarc.{domain}"):
+        if x.lower().startswith("v=dmarc1"):
+            return x
+    return None
 
-def ip_in_spf(ip, spf_record):
-    if not spf_record:
+def dkim_exists(selector, domain):
+    try:
+        vals = txt_records(f"{selector}._domainkey.{domain}")
+        return any("p=" in x for x in vals)
+    except:
         return False
 
-    parts = spf_record.split()
+def ip_in_spf(ip, spf):
+    if not spf:
+        return False
 
-    for p in parts:
-
-        if p.startswith("ip4:"):
-            block = p.replace("ip4:", "").strip()
-
+    for token in spf.split():
+        if token.startswith("ip4:"):
+            val = token.replace("ip4:", "")
             try:
-                if "/" in block:
-                    network = ipaddress.ip_network(block, strict=False)
-                    if ipaddress.ip_address(ip) in network:
+                if "/" in val:
+                    if ipaddress.ip_address(ip) in ipaddress.ip_network(val, strict=False):
                         return True
                 else:
-                    if ip == block:
+                    if ip == val:
                         return True
             except:
                 pass
-
     return False
 
-
-def get_dmarc_record(domain):
-    try:
-        txts = get_txt_records(f"_dmarc.{domain}")
-        for item in txts:
-            if item.lower().startswith("v=dmarc1"):
-                return item
-        return None
-    except:
-        return None
-
-
-def dkim_selector_exists(selector, domain):
-    try:
-        host = f"{selector}._domainkey.{domain}"
-        txts = get_txt_records(host)
-
-        for item in txts:
-            if "p=" in item:
-                return True
-
-        return False
-    except:
-        return False
-
-
-def reverse_dns(ip):
+def ptr(ip):
     try:
         return socket.gethostbyaddr(ip)[0]
     except:
         return None
 
-
-def fcrdns_check(ip):
-    ptr = reverse_dns(ip)
-
-    if not ptr:
-        return False, None
+def fcrdns(ip):
+    host = ptr(ip)
+    if not host:
+        return "FAIL", "No PTR", ""
 
     try:
-        ips = socket.gethostbyname_ex(ptr)[2]
+        ips = socket.gethostbyname_ex(host)[2]
+
         if ip in ips:
-            return True, ptr
-        return False, ptr
+            return "PASS", host, ",".join(ips)
+        else:
+            return "FAIL", host, ",".join(ips)
+
     except:
-        return False, ptr
+        return "FAIL", host, ""
 
+def email_domain(v):
+    if "@" in str(v):
+        return v.split("@")[-1].strip().lower()
+    return str(v).strip().lower()
 
-# ---------------------------------------------------
-# Utilities
-# ---------------------------------------------------
-
-def parse_domain(value):
-    if "@" in value:
-        return value.split("@")[-1].strip()
-    return value.strip()
-
-
-def base_domain(domain):
-    parts = domain.split(".")
+def org_domain(v):
+    parts = v.split(".")
     if len(parts) >= 2:
         return ".".join(parts[-2:])
-    return domain
+    return v
 
+# -------------------------------------------------
+# PROCESS FUNCTION
+# -------------------------------------------------
 
-# ---------------------------------------------------
+def process_row(domain, selector, from_email, return_path, ip,
+                run_spf, run_dkim, run_dmarc, run_fcrdns):
+
+    row = {
+        "Domain": domain,
+        "IP": ip
+    }
+
+    spf = get_spf(domain) if run_spf else None
+    dmarc = get_dmarc(domain) if run_dmarc else None
+
+    # SPF
+    if run_spf:
+        row["SPF"] = f"PASS with IP {ip}" if ip_in_spf(ip, spf) else "FAIL"
+
+    # DKIM
+    if run_dkim:
+        row["DKIM"] = f"PASS with domain {domain}" if dkim_exists(selector, domain) else "FAIL"
+
+    # DMARC
+    if run_dmarc:
+        fd = email_domain(from_email)
+        rp = email_domain(return_path)
+
+        aligned = (
+            org_domain(fd) == org_domain(domain)
+            or org_domain(rp) == org_domain(domain)
+        )
+
+        row["DMARC"] = "PASS" if dmarc and aligned else "FAIL"
+
+    # FCrDNS
+    if run_fcrdns:
+        status, host, forward_ips = fcrdns(ip)
+        row["FCrDNS"] = status
+        row["PTR Host"] = host
+        row["Forward IPs"] = forward_ips
+
+    return row
+
+# -------------------------------------------------
 # UI
-# ---------------------------------------------------
+# -------------------------------------------------
 
-st.title("📩 Email Preflight Checker")
-st.caption("Validate SPF, DKIM, DMARC and FCrDNS for outbound IPs before first hit.")
+st.title("📩 Bulk Email Preflight Checker")
 
-# ---------------------------------------------------
-# Checkboxes
-# ---------------------------------------------------
+tab1, tab2 = st.tabs(["Single Check", "Bulk Upload"])
+
+# -------------------------------------------------
+# CHECKBOXES
+# -------------------------------------------------
 
 st.subheader("Select Checks")
 
 c1, c2, c3, c4 = st.columns(4)
 
 with c1:
-    check_spf = st.checkbox("SPF", value=True)
+    run_spf = st.checkbox("SPF", True)
 
 with c2:
-    check_dkim = st.checkbox("DKIM", value=True)
+    run_dkim = st.checkbox("DKIM", True)
 
 with c3:
-    check_dmarc = st.checkbox("DMARC", value=True)
+    run_dmarc = st.checkbox("DMARC", True)
 
 with c4:
-    check_fcrdns = st.checkbox("FCrDNS", value=True)
+    run_fcrdns = st.checkbox("FCrDNS", True)
 
-st.divider()
+# -------------------------------------------------
+# SINGLE TAB
+# -------------------------------------------------
 
-# ---------------------------------------------------
-# Inputs
-# ---------------------------------------------------
+with tab1:
 
-left, right = st.columns(2)
+    st.subheader("Single Validation")
 
-with left:
-    domain = st.text_input("Main Domain", "loanpathwaynow.com")
-    selector = st.text_input("DKIM Selector", "pat084")
-    from_email = st.text_input("From Email", "insights@loanpathwaynow.com")
+    l, r = st.columns(2)
 
-with right:
-    return_path = st.text_input("Return Path", "insights@loanpathwaynow.com")
-    ips_raw = st.text_area(
-        "Outbound IPs (comma or new line separated)",
-        "194.34.237.62\n194.34.237.63",
-        height=140
-    )
+    with l:
+        domain = st.text_input("Domain")
+        selector = st.text_input("DKIM Selector")
+        from_email = st.text_input("From Email")
 
-run = st.button("🚀 Run Preflight Check")
+    with r:
+        return_path = st.text_input("Return Path")
+        ips_raw = st.text_area("IPs (comma/new line)")
 
-# ---------------------------------------------------
-# Run Logic
-# ---------------------------------------------------
+    if st.button("Run Single Check"):
 
-if run:
+        ips = [x.strip() for x in re.split(r"[,\n]+", ips_raw) if x.strip()]
 
-    ip_list = re.split(r"[,\n]+", ips_raw)
-    ip_list = [x.strip() for x in ip_list if x.strip()]
+        if not domain:
+            st.warning("Domain required")
+            st.stop()
 
-    rows = []
+        if not ips:
+            st.warning("IP required")
+            st.stop()
 
-    # fetch once
-    spf_record = get_spf_record(domain) if check_spf else None
-    dkim_ready = dkim_selector_exists(selector, domain) if check_dkim else None
-    dmarc_record = get_dmarc_record(domain) if check_dmarc else None
+        rows = []
 
-    from_domain = parse_domain(from_email)
-    rp_domain = parse_domain(return_path)
-
-    for ip in ip_list:
-
-        row = {"IP": ip}
-
-        # SPF
-        if check_spf:
-            if ip_in_spf(ip, spf_record):
-                row["SPF"] = f"PASS with IP {ip}"
-            else:
-                row["SPF"] = "FAIL"
-
-        # DKIM
-        if check_dkim:
-            if dkim_ready:
-                row["DKIM"] = f"PASS with domain {domain}"
-            else:
-                row["DKIM"] = "FAIL"
-
-        # DMARC
-        if check_dmarc:
-
-            aligned = (
-                base_domain(from_domain) == base_domain(domain)
-                or base_domain(rp_domain) == base_domain(domain)
+        for ip in ips:
+            rows.append(
+                process_row(
+                    domain, selector, from_email,
+                    return_path, ip,
+                    run_spf, run_dkim,
+                    run_dmarc, run_fcrdns
+                )
             )
 
-            if dmarc_record and aligned:
-                row["DMARC"] = "PASS"
-            else:
-                row["DMARC"] = "FAIL"
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True)
 
-        # FCrDNS
-        if check_fcrdns:
-            ok, ptr = fcrdns_check(ip)
+# -------------------------------------------------
+# BULK TAB
+# -------------------------------------------------
 
-            row["FCrDNS"] = "PASS" if ok else "FAIL"
-            row["PTR Hostname"] = ptr if ptr else "No PTR"
+with tab2:
 
-        rows.append(row)
+    st.subheader("Bulk CSV Upload")
 
-    df = pd.DataFrame(rows)
+    sample = pd.DataFrame([
+        {
+            "domain": "loanpathwaynow.com",
+            "selector": "pat084",
+            "from_email": "insights@loanpathwaynow.com",
+            "return_path": "insights@loanpathwaynow.com",
+            "ip": "194.34.237.62"
+        },
+        {
+            "domain": "finshots.in",
+            "selector": "lgathoxm23wr275ega6lju2bgmuxkolm",
+            "from_email": "morning@finshots.in",
+            "return_path": "bounce@mailer.finshots.in",
+            "ip": "24.110.92.9"
+        }
+    ])
 
-    # ---------------------------------------------------
-    # Summary
-    # ---------------------------------------------------
+    csv = sample.to_csv(index=False)
 
-    st.subheader("📊 Summary")
+    st.download_button(
+        "📥 Download Sample CSV",
+        csv,
+        file_name="sample_preflight.csv",
+        mime="text/csv"
+    )
 
-    m1, m2, m3, m4 = st.columns(4)
+    file = st.file_uploader("Upload CSV", type=["csv"])
 
-    if check_spf:
-        val = "PASS" if all("PASS" in x for x in df["SPF"]) else "FAIL"
-        m1.metric("SPF", val)
+    if file is not None:
 
-    if check_dkim:
-        val = "PASS" if all("PASS" in x for x in df["DKIM"]) else "FAIL"
-        m2.metric("DKIM", val)
+        df_input = pd.read_csv(file)
 
-    if check_dmarc:
-        val = "PASS" if all("PASS" in x for x in df["DMARC"]) else "FAIL"
-        m3.metric("DMARC", val)
+        st.write("Preview:")
+        st.dataframe(df_input, use_container_width=True)
 
-    if check_fcrdns:
-        val = "PASS" if all("PASS" in x for x in df["FCrDNS"]) else "FAIL"
-        m4.metric("FCrDNS", val)
+        if st.button("Run Bulk Check"):
 
-    st.divider()
+            output = []
 
-    # ---------------------------------------------------
-    # Gmail Preview
-    # ---------------------------------------------------
+            for _, r in df_input.iterrows():
 
-    st.subheader("📬 Gmail Show Original Preview")
+                row = process_row(
+                    str(r.get("domain", "")),
+                    str(r.get("selector", "")),
+                    str(r.get("from_email", "")),
+                    str(r.get("return_path", "")),
+                    str(r.get("ip", "")),
+                    run_spf,
+                    run_dkim,
+                    run_dmarc,
+                    run_fcrdns
+                )
 
-    first = df.iloc[0]
+                output.append(row)
 
-    if check_spf:
-        st.code(first["SPF"])
+            result = pd.DataFrame(output)
 
-    if check_dkim:
-        st.code(first["DKIM"])
+            st.subheader("Results")
+            st.dataframe(result, use_container_width=True)
 
-    if check_dmarc:
-        st.code("DMARC: " + first["DMARC"])
+            csv_out = result.to_csv(index=False)
 
-    st.divider()
-
-    # ---------------------------------------------------
-    # Detailed Results
-    # ---------------------------------------------------
-
-    st.subheader("📋 Detailed Results")
-    st.dataframe(df, use_container_width=True)
-
-    st.divider()
-
-    # ---------------------------------------------------
-    # Final Verdict
-    # ---------------------------------------------------
-
-    all_good = True
-
-    if check_spf:
-        all_good = all_good and all("PASS" in x for x in df["SPF"])
-
-    if check_dkim:
-        all_good = all_good and all("PASS" in x for x in df["DKIM"])
-
-    if check_dmarc:
-        all_good = all_good and all("PASS" in x for x in df["DMARC"])
-
-    if check_fcrdns:
-        all_good = all_good and all("PASS" in x for x in df["FCrDNS"])
-
-    st.subheader("🚦 Launch Readiness")
-
-    if all_good:
-        st.success("✅ READY FOR FIRST HIT")
-    else:
-        st.error("❌ NOT READY FOR FIRST HIT")
+            st.download_button(
+                "📥 Download Results CSV",
+                csv_out,
+                file_name="preflight_results.csv",
+                mime="text/csv"
+            )
