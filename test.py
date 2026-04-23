@@ -1,7 +1,6 @@
 # app.py
 # HIGH-SPEED BULK EMAIL PREFLIGHT CHECKER
-# Multi-threaded version for 3k+ rows
-# SPF / DKIM / DMARC / FCrDNS
+# Optimized default threads for 3k to 5k rows on local machine
 
 import streamlit as st
 import pandas as pd
@@ -28,12 +27,6 @@ st.set_page_config(
 st.markdown("""
 <style>
 .main {padding-top:15px;}
-div[data-testid="metric-container"]{
-background:#111827;
-border:1px solid #374151;
-padding:14px;
-border-radius:14px;
-}
 .stButton button{
 width:100%;
 height:48px;
@@ -42,6 +35,14 @@ font-weight:700;
 }
 </style>
 """, unsafe_allow_html=True)
+
+# ---------------------------------------------------
+# DEFAULT THREADS
+# ---------------------------------------------------
+# IDEAL FOR LOCAL MACHINE 3K TO 5K RECORDS
+# YOU CAN CHANGE THIS VALUE IF NEEDED
+
+DEFAULT_THREADS = 75
 
 # ---------------------------------------------------
 # DNS RESOLVER
@@ -83,6 +84,7 @@ def get_dmarc(domain):
 def dkim_exists(selector, domain):
     if not selector:
         return False
+
     try:
         vals = txt_records(f"{selector}._domainkey.{domain}")
         return any("p=" in x for x in vals)
@@ -120,114 +122,52 @@ def fcrdns(ip):
     host = ptr(ip)
 
     if not host:
-        return "FAIL", "No PTR", ""
+        return "FAIL", "No PTR"
 
     try:
         ips = socket.gethostbyname_ex(host)[2]
 
         if ip in ips:
-            return "PASS", host, ",".join(ips)
+            return "PASS", host
         else:
-            return "FAIL", host, ",".join(ips)
+            return "FAIL", host
 
     except:
-        return "FAIL", host, ""
-
-def email_domain(v):
-    if "@" in str(v):
-        return v.split("@")[-1].strip().lower()
-    return str(v).strip().lower()
-
-def org_domain(v):
-    parts = v.split(".")
-    if len(parts) >= 2:
-        return ".".join(parts[-2:])
-    return v
+        return "FAIL", host
 
 def split_ips(value):
-    if pd.isna(value):
-        return []
-
     vals = re.split(r"[,\n|]+", str(value))
     return [x.strip() for x in vals if x.strip()]
 
 # ---------------------------------------------------
-# CACHE
+# MAIN CHECK
 # ---------------------------------------------------
 
-spf_cache = {}
-dmarc_cache = {}
-dkim_cache = {}
+def process_row(job):
 
-def cached_spf(domain):
-    if domain not in spf_cache:
-        spf_cache[domain] = get_spf(domain)
-    return spf_cache[domain]
-
-def cached_dmarc(domain):
-    if domain not in dmarc_cache:
-        dmarc_cache[domain] = get_dmarc(domain)
-    return dmarc_cache[domain]
-
-def cached_dkim(selector, domain):
-    key = f"{selector}|{domain}"
-    if key not in dkim_cache:
-        dkim_cache[key] = dkim_exists(selector, domain)
-    return dkim_cache[key]
-
-# ---------------------------------------------------
-# MAIN PROCESS FUNCTION
-# ---------------------------------------------------
-
-def process_row(data):
-
-    domain = data["domain"]
-    selector = data["selector"]
-    from_email = data["from_email"]
-    return_path = data["return_path"]
-    ip = data["ip"]
-
-    run_spf = data["run_spf"]
-    run_dkim = data["run_dkim"]
-    run_dmarc = data["run_dmarc"]
-    run_fcrdns = data["run_fcrdns"]
+    domain = job["domain"]
+    selector = job["selector"]
+    from_email = job["from_email"]
+    return_path = job["return_path"]
+    ip = job["ip"]
 
     row = {
         "Domain": domain,
         "IP": ip
     }
 
-    # SPF
-    if run_spf:
-        spf = cached_spf(domain)
-        row["SPF"] = f"PASS with IP {ip}" if ip_in_spf(ip, spf) else "FAIL"
+    spf = get_spf(domain)
 
-    # DKIM
-    if run_dkim:
-        ok = cached_dkim(selector, domain)
-        row["DKIM"] = f"PASS with domain {domain}" if ok else "FAIL"
+    row["SPF"] = f"PASS with IP {ip}" if ip_in_spf(ip, spf) else "FAIL"
 
-    # DMARC
-    if run_dmarc:
+    row["DKIM"] = f"PASS with domain {domain}" if dkim_exists(selector, domain) else "FAIL"
 
-        dmarc = cached_dmarc(domain)
+    dmarc = get_dmarc(domain)
+    row["DMARC"] = "PASS" if dmarc else "FAIL"
 
-        fd = email_domain(from_email)
-        rp = email_domain(return_path)
-
-        aligned = (
-            org_domain(fd) == org_domain(domain)
-            or org_domain(rp) == org_domain(domain)
-        )
-
-        row["DMARC"] = "PASS" if dmarc and aligned else "FAIL"
-
-    # FCrDNS
-    if run_fcrdns:
-        status, host, fwd = fcrdns(ip)
-        row["FCrDNS"] = status
-        row["PTR Host"] = host
-        row["Forward IPs"] = fwd
+    status, host = fcrdns(ip)
+    row["FCrDNS"] = status
+    row["PTR Host"] = host
 
     return row
 
@@ -236,26 +176,6 @@ def process_row(data):
 # ---------------------------------------------------
 
 st.title("📩 High Speed Bulk Email Preflight Checker")
-
-st.subheader("Select Checks")
-
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-    run_spf = st.checkbox("SPF", True)
-
-with c2:
-    run_dkim = st.checkbox("DKIM", True)
-
-with c3:
-    run_dmarc = st.checkbox("DMARC", True)
-
-with c4:
-    run_fcrdns = st.checkbox("FCrDNS", True)
-
-st.divider()
-
-st.subheader("Bulk CSV Upload")
 
 sample = pd.DataFrame([
     {
@@ -276,17 +196,6 @@ st.download_button(
 
 file = st.file_uploader("Upload CSV", type=["csv"])
 
-workers = st.slider(
-    "Threads",
-    min_value=5,
-    max_value=100,
-    value=30
-)
-
-# ---------------------------------------------------
-# RUN BULK
-# ---------------------------------------------------
-
 if file is not None:
 
     df = pd.read_csv(file)
@@ -294,43 +203,34 @@ if file is not None:
     st.write("Preview")
     st.dataframe(df.head(20), use_container_width=True)
 
-    if st.button("🚀 Run High Speed Bulk Check"):
+    if st.button("🚀 Run Bulk Check"):
 
         jobs = []
 
         for _, r in df.iterrows():
-
-            domain = str(r.get("domain", "")).strip()
-            selector = str(r.get("selector", "")).strip()
-            from_email = str(r.get("from_email", "")).strip()
-            return_path = str(r.get("return_path", "")).strip()
 
             ips = split_ips(r.get("ip", ""))
 
             for ip in ips:
 
                 jobs.append({
-                    "domain": domain,
-                    "selector": selector,
-                    "from_email": from_email,
-                    "return_path": return_path,
-                    "ip": ip,
-                    "run_spf": run_spf,
-                    "run_dkim": run_dkim,
-                    "run_dmarc": run_dmarc,
-                    "run_fcrdns": run_fcrdns
+                    "domain": str(r.get("domain", "")).strip(),
+                    "selector": str(r.get("selector", "")).strip(),
+                    "from_email": str(r.get("from_email", "")).strip(),
+                    "return_path": str(r.get("return_path", "")).strip(),
+                    "ip": ip
                 })
 
         total = len(jobs)
 
-        st.info(f"Total checks to run: {total}")
+        st.info(f"Running {total} checks with {DEFAULT_THREADS} threads")
 
         progress = st.progress(0)
 
         results = []
         done = 0
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with ThreadPoolExecutor(max_workers=DEFAULT_THREADS) as executor:
 
             futures = [executor.submit(process_row, job) for job in jobs]
 
@@ -343,12 +243,11 @@ if file is not None:
 
         st.success("Completed")
 
-        st.subheader("Results")
         st.dataframe(out, use_container_width=True)
 
         st.download_button(
             "📥 Download Results CSV",
             out.to_csv(index=False),
-            file_name="preflight_results.csv",
+            file_name="results.csv",
             mime="text/csv"
         )
