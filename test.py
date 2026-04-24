@@ -1,8 +1,19 @@
 # app.py
-# FINAL PRODUCTION VERSION
-# Single Check + Bulk Upload
-# 75 threads optimized for 3k–5k rows
-# Same terminology labels everywhere
+# FINAL ENTERPRISE VERSION
+# ------------------------------------------------------------
+# Supports:
+# ✅ Single Entry Grid (can paste 1 row or many rows like Excel)
+# ✅ Bulk CSV Upload
+# ✅ Required Column Order:
+#    Domain
+#    Return Path Address
+#    From Domain DKIM Selector Id
+#    Display From
+#    Ip Address
+# ✅ Multi IPs in one cell (comma | newline | pipe)
+# ✅ SPF / DKIM / DMARC / FCrDNS
+# ✅ Multithreaded (ideal for 3k to 5k rows local)
+# ------------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
@@ -12,9 +23,9 @@ import ipaddress
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ---------------------------------------------------
-# CONFIG
-# ---------------------------------------------------
+# ------------------------------------------------------------
+# PAGE
+# ------------------------------------------------------------
 
 st.set_page_config(
     page_title="Email Preflight Checker",
@@ -22,41 +33,41 @@ st.set_page_config(
     layout="wide"
 )
 
-# ---------------------------------------------------
-# THREADS
-# Ideal for local machine 3k–5k rows
-# Change here if needed
-# ---------------------------------------------------
+# ------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------
+# IDEAL DEFAULT FOR 3K - 5K LOCAL ROWS
+# YOU CAN CHANGE THIS VALUE
 
 DEFAULT_THREADS = 75
 
-# ---------------------------------------------------
+# ------------------------------------------------------------
 # CSS
-# ---------------------------------------------------
+# ------------------------------------------------------------
 
 st.markdown("""
 <style>
 .main {padding-top:15px;}
 .stButton button{
 width:100%;
-height:46px;
+height:48px;
 border-radius:12px;
 font-weight:700;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------------------------------------
+# ------------------------------------------------------------
 # DNS
-# ---------------------------------------------------
+# ------------------------------------------------------------
 
 resolver = dns.resolver.Resolver()
 resolver.timeout = 2
 resolver.lifetime = 2
 
-# ---------------------------------------------------
+# ------------------------------------------------------------
 # HELPERS
-# ---------------------------------------------------
+# ------------------------------------------------------------
 
 def txt_records(name):
     try:
@@ -86,6 +97,7 @@ def get_dmarc(domain):
 def dkim_exists(selector, domain):
     if not selector:
         return False
+
     try:
         vals = txt_records(f"{selector}._domainkey.{domain}")
         return any("p=" in x for x in vals)
@@ -97,8 +109,10 @@ def ip_in_spf(ip, spf):
         return False
 
     for token in spf.split():
+
         if token.startswith("ip4:"):
             val = token.replace("ip4:", "")
+
             try:
                 if "/" in val:
                     if ipaddress.ip_address(ip) in ipaddress.ip_network(val, strict=False):
@@ -108,6 +122,7 @@ def ip_in_spf(ip, spf):
                         return True
             except:
                 pass
+
     return False
 
 def ptr(ip):
@@ -133,23 +148,35 @@ def fcrdns(ip):
     except:
         return "FAIL", host
 
+def email_domain(v):
+    if "@" in str(v):
+        return v.split("@")[-1].strip().lower()
+    return str(v).strip().lower()
+
+def org_domain(v):
+    parts = v.split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return v
+
 def split_ips(value):
     vals = re.split(r"[,\n|]+", str(value))
     return [x.strip() for x in vals if x.strip()]
 
-# ---------------------------------------------------
+# ------------------------------------------------------------
 # MAIN CHECK
-# ---------------------------------------------------
+# ------------------------------------------------------------
 
-def run_check(domain, return_path, from_domain,
-              selector, display_from, ip):
+def process_row(job):
+
+    domain = str(job["Domain"]).strip()
+    return_path = str(job["Return Path Address"]).strip()
+    selector = str(job["From Domain DKIM Selector Id"]).strip()
+    from_email = str(job["Display From"]).strip()
+    ip = str(job["Ip Address"]).strip()
 
     row = {
         "Domain": domain,
-        "Return Path Address": return_path,
-        "From Domain": from_domain,
-        "DKIM Selector Id": selector,
-        "Display From": display_from,
         "Ip Address": ip
     }
 
@@ -162,7 +189,16 @@ def run_check(domain, return_path, from_domain,
 
     # DMARC
     dmarc = get_dmarc(domain)
-    row["DMARC"] = "PASS" if dmarc else "FAIL"
+
+    fd = email_domain(from_email)
+    rp = email_domain(return_path)
+
+    aligned = (
+        org_domain(fd) == org_domain(domain)
+        or org_domain(rp) == org_domain(domain)
+    )
+
+    row["DMARC"] = "PASS" if dmarc and aligned else "FAIL"
 
     # FCrDNS
     status, host = fcrdns(ip)
@@ -171,87 +207,122 @@ def run_check(domain, return_path, from_domain,
 
     return row
 
-# ---------------------------------------------------
+# ------------------------------------------------------------
+# BULK ENGINE
+# ------------------------------------------------------------
+
+def run_jobs(df):
+
+    jobs = []
+
+    for _, r in df.iterrows():
+
+        ips = split_ips(r["Ip Address"])
+
+        for ip in ips:
+
+            jobs.append({
+                "Domain": r["Domain"],
+                "Return Path Address": r["Return Path Address"],
+                "From Domain DKIM Selector Id": r["From Domain DKIM Selector Id"],
+                "Display From": r["Display From"],
+                "Ip Address": ip
+            })
+
+    total = len(jobs)
+
+    progress = st.progress(0)
+
+    done = 0
+    results = []
+
+    with ThreadPoolExecutor(max_workers=DEFAULT_THREADS) as executor:
+
+        futures = [executor.submit(process_row, j) for j in jobs]
+
+        for future in as_completed(futures):
+            results.append(future.result())
+            done += 1
+            progress.progress(done / total)
+
+    return pd.DataFrame(results)
+
+# ------------------------------------------------------------
 # UI
-# ---------------------------------------------------
+# ------------------------------------------------------------
 
 st.title("📩 Email Preflight Checker")
 
-tab1, tab2 = st.tabs(["Single Check", "Bulk Upload"])
+tab1, tab2 = st.tabs(["Single / Excel Entry", "Bulk Upload"])
 
-# ===================================================
-# SINGLE CHECK
-# ===================================================
+# ------------------------------------------------------------
+# TAB 1
+# ------------------------------------------------------------
 
 with tab1:
 
-    st.subheader("Single Domain Check")
+    st.subheader("Single / Multi Row Entry")
 
-    c1, c2 = st.columns(2)
+    base = pd.DataFrame([
+        {
+            "Domain": "",
+            "Return Path Address": "",
+            "From Domain DKIM Selector Id": "",
+            "Display From": "",
+            "Ip Address": ""
+        }
+    ])
 
-    with c1:
-        domain = st.text_input("Domain")
-        return_path = st.text_input("Return Path Address")
-        from_domain = st.text_input("From Domain")
+    edited = st.data_editor(
+        base,
+        num_rows="dynamic",
+        use_container_width=True
+    )
 
-    with c2:
-        selector = st.text_input("DKIM Selector Id")
-        display_from = st.text_input("Display From")
-        ip_raw = st.text_area("Ip Address (single / comma / newline / pipe)")
+    if st.button("🚀 Run Grid Check"):
 
-    if st.button("🚀 Run Single Check"):
+        df = pd.DataFrame(edited)
 
-        if not domain:
-            st.warning("Domain required")
+        df = df[
+            df["Domain"].astype(str).str.strip() != ""
+        ]
+
+        if len(df) == 0:
+            st.warning("Enter at least one row")
             st.stop()
 
-        ips = split_ips(ip_raw)
-
-        if not ips:
-            st.warning("At least one IP required")
-            st.stop()
-
-        rows = []
-
-        for ip in ips:
-            rows.append(
-                run_check(
-                    domain,
-                    return_path,
-                    from_domain,
-                    selector,
-                    display_from,
-                    ip
-                )
-            )
-
-        df = pd.DataFrame(rows)
+        result = run_jobs(df)
 
         st.subheader("Results")
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(result, use_container_width=True)
 
-# ===================================================
-# BULK CHECK
-# ===================================================
+        st.download_button(
+            "📥 Download Results CSV",
+            result.to_csv(index=False),
+            file_name="results.csv",
+            mime="text/csv"
+        )
+
+# ------------------------------------------------------------
+# TAB 2
+# ------------------------------------------------------------
 
 with tab2:
 
-    st.subheader("Bulk Upload CSV")
+    st.subheader("Bulk CSV Upload")
 
     sample = pd.DataFrame([
         {
             "Domain": "loanpathwaynow.com",
             "Return Path Address": "insights@loanpathwaynow.com",
-            "From Domain": "loanpathwaynow.com",
-            "DKIM Selector Id": "pat084",
+            "From Domain DKIM Selector Id": "pat084",
             "Display From": "insights@loanpathwaynow.com",
             "Ip Address": "194.34.237.62,194.34.237.63"
         },
         {
             "Domain": "finshots.in",
             "Return Path Address": "bounce@mailer.finshots.in",
-            "From Domain": "finshots.in",
-            "DKIM Selector Id": "lgathoxm23wr275ega6lju2bgmuxkolm",
+            "From Domain DKIM Selector Id": "lgathoxm23wr275ega6lju2bgmuxkolm",
             "Display From": "morning@finshots.in",
             "Ip Address": "24.110.92.9"
         }
@@ -275,61 +346,14 @@ with tab2:
 
         if st.button("🚀 Run Bulk Check"):
 
-            jobs = []
+            result = run_jobs(df)
 
-            for _, r in df.iterrows():
-
-                ips = split_ips(r.get("Ip Address", ""))
-
-                for ip in ips:
-
-                    jobs.append({
-                        "Domain": str(r.get("Domain", "")).strip(),
-                        "Return Path Address": str(r.get("Return Path Address", "")).strip(),
-                        "From Domain": str(r.get("From Domain", "")).strip(),
-                        "DKIM Selector Id": str(r.get("DKIM Selector Id", "")).strip(),
-                        "Display From": str(r.get("Display From", "")).strip(),
-                        "Ip Address": ip
-                    })
-
-            total = len(jobs)
-
-            st.info(f"Running {total} checks with {DEFAULT_THREADS} threads")
-
-            progress = st.progress(0)
-
-            results = []
-            done = 0
-
-            with ThreadPoolExecutor(max_workers=DEFAULT_THREADS) as executor:
-
-                futures = [
-                    executor.submit(
-                        run_check,
-                        j["Domain"],
-                        j["Return Path Address"],
-                        j["From Domain"],
-                        j["DKIM Selector Id"],
-                        j["Display From"],
-                        j["Ip Address"]
-                    )
-                    for j in jobs
-                ]
-
-                for future in as_completed(futures):
-                    results.append(future.result())
-                    done += 1
-                    progress.progress(done / total)
-
-            out = pd.DataFrame(results)
-
-            st.success("Completed")
-
-            st.dataframe(out, use_container_width=True)
+            st.subheader("Results")
+            st.dataframe(result, use_container_width=True)
 
             st.download_button(
                 "📥 Download Results CSV",
-                out.to_csv(index=False),
-                file_name="results.csv",
+                result.to_csv(index=False),
+                file_name="bulk_results.csv",
                 mime="text/csv"
             )
