@@ -67,7 +67,11 @@ def extract_auth_results_from_headers(msg):
     return spf, dkim, dmarc
 
 # Sub-ID extraction
-ID_RE = re.compile(r'\b(GRM-[A-Za-z0-9\-]+|GMFP-[A-Za-z0-9\-]+|GTC-[A-Za-z0-9\-]+|GRTC-[A-Za-z0-9\-]+)\b', re.I)
+ID_RE = re.compile(
+r'\b(GRM-[A-Za-z0-9.\-]+|GMFP-[A-Za-z0-9.\-]+|GTC-[A-Za-z0-9.\-]+|GRTC-[A-Za-z0-9.\-]+)\b',
+re.I
+)
+
 def map_id_to_type(sub_id):
     if not sub_id: return "-"
     lid = sub_id.lower()
