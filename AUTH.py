@@ -7,459 +7,385 @@ import datetime
 import re
 import pandas as pd
 import base64
+import concurrent.futures
 
-# --- Page Setup ---
+# ---------------- PAGE ----------------
 st.set_page_config(page_title="Email Auth Checker", layout="wide")
-st.title("📧 Email Authentication Report (SPF/DKIM/DMARC)")
+st.title("📧 Email Authentication Report (SPF / DKIM / DMARC)")
 
-# Define the columns (Batch_ID is included for logic, but will be hidden)
-DF_COLS = ["Subject", "Date", "SPF", "DKIM", "DMARC", "Domain", "Type", "Sub ID", "Message-ID", "Mailbox", "Batch_ID"]
+DF_COLS = [
+    "Subject", "Date", "SPF", "DKIM", "DMARC",
+    "Domain", "Type", "Sub ID", "Message-ID",
+    "Mailbox", "Batch_ID"
+]
 
-# --- Session state setup ---
-if 'df' not in st.session_state:
+# ---------------- SESSION ----------------
+if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(columns=DF_COLS)
-if 'last_uid' not in st.session_state:
-    st.session_state.last_uid = None
-if 'spam_df' not in st.session_state:
+
+if "spam_df" not in st.session_state:
     st.session_state.spam_df = pd.DataFrame(columns=DF_COLS)
-if 'email_input' not in st.session_state:
-    st.session_state.email_input = ""
-if 'password_input' not in st.session_state:
-    st.session_state.password_input = ""
-if 'batch_counter' not in st.session_state:
+
+if "last_uid" not in st.session_state:
+    st.session_state.last_uid = None
+
+if "batch_counter" not in st.session_state:
     st.session_state.batch_counter = 0
 
-# --- Initialize or update dates ---
 today = datetime.date.today()
-if 'fetch_dates' not in st.session_state or st.session_state.fetch_dates is None:
+
+if "fetch_dates" not in st.session_state:
     st.session_state.fetch_dates = (today, today)
 
-# --- Email + Password + Date Selection Row ---
+# ---------------- UI ----------------
 with st.container():
-    col1, col2, col3, col4 = st.columns([3, 3, 2, 1])
+    c1, c2, c3, c4 = st.columns([3, 3, 2, 1])
 
-    with col1:
-        email_input = st.text_input("📧 Gmail Address", key="email_box")
+    with c1:
+        gmail_user = st.text_input("📧 Gmail Address")
 
-    with col2:
-        password_input = st.text_input("🔐 App Password", type="password", key="pwd_box")
-    
-    with col3:
+    with c2:
+        gmail_pass = st.text_input("🔐 App Password", type="password")
+
+    with c3:
         date_range = st.date_input(
-            "Select Date Range", 
-            value=st.session_state.fetch_dates, 
-            max_value=today,
-            key="date_box",
-            help="Select the start and end dates for fetching emails."
+            "Select Date Range",
+            value=st.session_state.fetch_dates,
+            max_value=today
         )
-        
-        if isinstance(date_range, tuple) and len(date_range) == 2:
-            start_date, end_date = date_range
-            if start_date > end_date:
-                start_date, end_date = end_date, start_date
-            st.session_state.fetch_dates = (start_date, end_date)
-        elif isinstance(date_range, datetime.date):
-            st.session_state.fetch_dates = (date_range, date_range)
-        elif date_range is None or len(date_range) == 0:
-            st.session_state.fetch_dates = (today, today)
 
-    with col4:
-        st.markdown("####")
-        if st.button("🔁", help="Clear all data and credentials"):
-            for key in list(st.session_state.keys()):
-                if key not in ['date_box', 'fetch_dates']:
-                    del st.session_state[key]
+        if isinstance(date_range, tuple):
+            start_date, end_date = date_range
+        else:
+            start_date = date_range
+            end_date = date_range
+
+        st.session_state.fetch_dates = (start_date, end_date)
+
+    with c4:
+        st.markdown("###")
+        if st.button("🔁"):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
             st.rerun()
 
-# --- Store credentials ---
-st.session_state.email_input = email_input
-st.session_state.password_input = password_input
-
-if not st.session_state.email_input or not st.session_state.password_input:
-    st.warning("Please enter both your Gmail address and an App Password to continue.")
+if not gmail_user or not gmail_pass:
+    st.warning("Enter Gmail + App Password")
     st.stop()
 
-START_DATE = st.session_state.fetch_dates[0]
-END_DATE = st.session_state.fetch_dates[1]
-IS_DEFAULT_TODAY = (START_DATE == today and END_DATE == today)
-IS_SINGLE_DAY = (START_DATE == END_DATE)
-
-
-# --- Utility Functions ---
-
+# ---------------- HELPERS ----------------
 def decode_mime_words(s):
-    """Decode MIME encoded words safely."""
-    decoded_string = ""
     if not s:
-        return decoded_string
-    for part, encoding in decode_header(s):
+        return ""
+    out = ""
+    for part, enc in decode_header(s):
         try:
             if isinstance(part, bytes):
-                decoded_string += part.decode(encoding or 'utf-8', errors='ignore')
+                out += part.decode(enc or "utf-8", errors="ignore")
             else:
-                decoded_string += part
-        except (LookupError, TypeError):
-            if isinstance(part, bytes):
-                decoded_string += part.decode('utf-8', errors='ignore')
-            else:
-                decoded_string += str(part)
-    return decoded_string.strip()
+                out += part
+        except:
+            pass
+    return out.strip()
 
-def format_date_ist(date_str):
-    """
-    Parses email date, converts to Indian Standard Time (IST),
-    and returns a clean string (DD-MMM-YYYY HH:MM AM/PM).
-    """
-    if not date_str:
-        return "-"
+def format_date_ist(raw):
     try:
-        # Parse the email date string into a datetime object (aware of timezone)
-        dt = parsedate_to_datetime(date_str)
-        
-        # Define IST timezone (UTC +5:30)
-        ist_offset = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-        
-        # Convert to IST
-        dt_ist = dt.astimezone(ist_offset)
-        
-        # Format: 21-Nov-2025 04:50 PM
-        return dt_ist.strftime("%d-%b-%Y %I:%M %p")
-    except Exception:
-        # Fallback if parsing fails
-        return str(date_str)
+        dt = parsedate_to_datetime(raw)
+        ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+        dt = dt.astimezone(ist)
+        return dt.strftime("%d-%b-%Y %I:%M %p")
+    except:
+        return raw
 
-def extract_id_details(search_string, data):
-    """
-    Finds the matching Sub ID pattern and sets the Type.
-    Includes GRTC -> FPRTC mapping.
-    """
-    sub_id_match = re.search(
-    r'(GRM-[A-Za-z0-9._-]+|GMFP-[A-Za-z0-9._-]+|GTC-[A-Za-z0-9._-]+|GRTC-[A-Za-z0-9._-]+)',
-    search_string,
-    re.I
+def extract_subid(search_string, data):
+    m = re.search(
+        r'(GRM-[A-Za-z0-9._-]+|GMFP-[A-Za-z0-9._-]+|GTC-[A-Za-z0-9._-]+|GRTC-[A-Za-z0-9._-]+)',
+        search_string,
+        re.I
     )
 
-    if sub_id_match:
-        matched_id_string = sub_id_match.group(1)
-        data["Sub ID"] = matched_id_string
-        id_lower = matched_id_string.lower()
-        
-        if 'grm' in id_lower:
-            data["Type"] = 'FPR'
-        elif 'gmfp' in id_lower:
-            data["Type"] = 'FP'
-        elif 'gtc' in id_lower:
-            data["Type"] = 'FPTC'
-        elif 'grtc' in id_lower:
-            data["Type"] = 'FPRTC'
-        
+    if m:
+        sid = m.group(1)
+        data["Sub ID"] = sid
+
+        x = sid.lower()
+
+        if x.startswith("grm"):
+            data["Type"] = "FPR"
+        elif x.startswith("gmfp"):
+            data["Type"] = "FP"
+        elif x.startswith("gtc"):
+            data["Type"] = "FPTC"
+        elif x.startswith("grtc"):
+            data["Type"] = "FPRTC"
+
         return True
+
     return False
 
-def parse_email_message(msg, current_batch_id):
-    """Extracts all relevant details from an email message object."""
-    
+def parse_email(msg, batch_id):
     raw_date = msg.get("Date", "")
-    
+
     data = {
         "Subject": decode_mime_words(msg.get("Subject", "No Subject")),
-        "Date": format_date_ist(raw_date), # Convert to IST here
-        "SPF": "-", "DKIM": "-", "DMARC": "-", "Domain": "-", 
-        "Type": "-", "Sub ID": "-", "Message-ID": decode_mime_words(msg.get("Message-ID", "")),
-        "Batch_ID": current_batch_id 
+        "Date": format_date_ist(raw_date),
+        "SPF": "-",
+        "DKIM": "-",
+        "DMARC": "-",
+        "Domain": "-",
+        "Type": "-",
+        "Sub ID": "-",
+        "Message-ID": decode_mime_words(msg.get("Message-ID", "")),
+        "Batch_ID": batch_id
     }
 
-    # --- Standard Header Parsing ---
-    headers_str = ''.join(f"{header}: {value}\n" for header, value in msg.items())
-    
-    match_auth = re.search(r'Authentication-Results:.*?smtp.mailfrom=([\w\.-]+)', headers_str, re.I)
-    if match_auth:
-        data["Domain"] = match_auth.group(1).lower()
+    headers = "".join(f"{k}: {v}\n" for k, v in msg.items())
+
+    # Domain
+    m = re.search(r'smtp.mailfrom=([\w\.-]+)', headers, re.I)
+    if m:
+        data["Domain"] = m.group(1).lower()
     else:
-        from_header = decode_mime_words(msg.get('From', ''))
-        match = re.search(r'<(?:.+@)?([\w\.-]+)>|@([\w\.-]+)$', from_header)
-        if match:
-            domain = match.group(1) if match.group(1) else match.group(2)
-            if domain:
-                data["Domain"] = domain.lower()
+        frm = msg.get("From", "")
+        m2 = re.search(r'@([\w\.-]+)', frm)
+        if m2:
+            data["Domain"] = m2.group(1).lower()
 
-    spf_match = re.search(r'spf=(\w+)', headers_str, re.I)
-    dkim_match = re.search(r'dkim=(\w+)', headers_str, re.I)
-    dmarc_match = re.search(r'dmarc=(\w+)', headers_str, re.I)
-    
-    if spf_match: data["SPF"] = spf_match.group(1).lower()
-    if dkim_match: data["DKIM"] = dkim_match.group(1).lower()
-    if dmarc_match: data["DMARC"] = dmarc_match.group(1).lower()
+    # Auth
+    m = re.search(r'spf=(\w+)', headers, re.I)
+    if m:
+        data["SPF"] = m.group(1).lower()
 
-    # --- ID Extraction Logic ---
-    found_plain_id = extract_id_details(headers_str, data)
-    if not found_plain_id:
-        for header_name, header_value in msg.items():
-            if not header_value: continue
-            parts = str(header_value).split('_')
+    m = re.search(r'dkim=(\w+)', headers, re.I)
+    if m:
+        data["DKIM"] = m.group(1).lower()
+
+    m = re.search(r'dmarc=(\w+)', headers, re.I)
+    if m:
+        data["DMARC"] = m.group(1).lower()
+
+    # Plain extract
+    found = extract_subid(headers, data)
+
+    # Hidden base64 extract
+    if not found:
+        for _, val in msg.items():
+            if not val:
+                continue
+
+            parts = re.split(r'[._@<>]', str(val))
+
             for part in parts:
-                if len(part) < 20: continue
+                if len(part) < 8:
+                    continue
+
                 try:
-                    padded_part = part + '=' * (-len(part) % 4)
-                    decoded_bytes = base64.b64decode(padded_part)
-                    decoded_string = decoded_bytes.decode('utf-8', errors='ignore')
-                    if extract_id_details(decoded_string, data):
+                    pad = part + "=" * (-len(part) % 4)
+                    dec = base64.b64decode(pad).decode("utf-8", errors="ignore")
+
+                    if extract_subid(dec, data):
                         break
-                except Exception:
+                except:
                     pass
+
             if data["Type"] != "-":
                 break
 
     return data
 
-
-def fetch_emails(start_date, end_date, mailbox="inbox", use_uid_since=False, last_uid=None, current_batch_id=0):
-    """Fetch emails using IMAP."""
-    results = []
-    
-    start_date_str = start_date.strftime("%d-%b-%Y")
-    day_after_end = end_date + datetime.timedelta(days=1)
-    day_after_end_str = day_after_end.strftime("%d-%b-%Y")
-    
+# ---------------- FETCH ----------------
+def fetch_mailbox(mailbox, start_date, end_date, use_uid=False, last_uid=None, batch_id=0):
+    rows = []
     new_last_uid = last_uid
-    
+
     try:
         imap = imaplib.IMAP4_SSL("imap.gmail.com")
-        imap.login(st.session_state.email_input, st.session_state.password_input)
+        imap.login(gmail_user, gmail_pass)
         imap.select(mailbox)
 
-        if mailbox == "inbox" and use_uid_since and last_uid:
-             criteria = f'(UID {int(last_uid)+1}:* SINCE {start_date_str} BEFORE {day_after_end_str})'
-        else:
-             criteria = f'(SINCE {start_date_str} BEFORE {day_after_end_str})'
+        s = start_date.strftime("%d-%b-%Y")
+        e = (end_date + datetime.timedelta(days=1)).strftime("%d-%b-%Y")
 
-        status, data = imap.uid('search', None, criteria)
+        if mailbox == "inbox" and use_uid and last_uid:
+            criteria = f'(UID {int(last_uid)+1}:* SINCE {s} BEFORE {e})'
+        else:
+            criteria = f'(SINCE {s} BEFORE {e})'
+
+        _, data = imap.uid("search", None, criteria)
         uids = data[0].split()
 
         for uid in uids:
-            uid_decoded = uid.decode()
-            _, msg_data = imap.uid('fetch', uid, '(BODY.PEEK[HEADER])')
-            for response_part in msg_data:
-                if isinstance(response_part, tuple):
-                    msg = email.message_from_bytes(response_part[1])
-                    # Pass batch ID here
-                    email_data = parse_email_message(msg, current_batch_id)
-                    email_data["Mailbox"] = "Inbox" if mailbox == "inbox" else "Spam"
-                    results.append(email_data)
-            
+            uid_str = uid.decode()
+
+            _, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[HEADER])")
+
+            for item in msg_data:
+                if isinstance(item, tuple):
+                    msg = email.message_from_bytes(item[1])
+                    row = parse_email(msg, batch_id)
+                    row["Mailbox"] = "Inbox" if mailbox == "inbox" else "Spam"
+                    rows.append(row)
+
             if mailbox == "inbox":
-                 new_last_uid = max(new_last_uid, uid_decoded) if new_last_uid else uid_decoded
+                if not new_last_uid:
+                    new_last_uid = uid_str
+                else:
+                    new_last_uid = str(max(int(new_last_uid), int(uid_str)))
 
         imap.logout()
-    except imaplib.IMAP4.error as e:
-        if "AUTHENTICATIONFAILED" in str(e).upper():
-             st.error("❌ Login Failed! Please check your **Gmail Address** and **App Password**.")
-        else:
-             st.error(f"❌ IMAP Error fetching from {mailbox}: {str(e)}")
+
     except Exception as e:
-        st.error(f"❌ General Error fetching from {mailbox}: {str(e)}")
-        
-    return pd.DataFrame(results, columns=DF_COLS), new_last_uid
+        st.error(f"{mailbox}: {e}")
 
+    return pd.DataFrame(rows, columns=DF_COLS), new_last_uid
 
-def process_fetch_results(new_df, new_uid, target_df):
-    """Handles concatenation and deduplication."""
-    if not target_df.empty:
-        seen_ids = set(target_df["Message-ID"].dropna())
-        new_df = new_df[~new_df["Message-ID"].isin(seen_ids)].copy()
+# ---------------- PROCESS ----------------
+def merge_df(new_df, old_df):
+    if old_df.empty:
+        return new_df
 
-    if not new_df.empty:
-        combined_df = pd.concat([new_df, target_df], ignore_index=True)
-        # Sort by Batch_ID descending so newest batches are on top
-        combined_df = combined_df.sort_values(
-            by='Batch_ID', 
-            ascending=False, 
-            ignore_index=True
-        )
-        return combined_df, len(new_df), new_uid
-    
-    return target_df, 0, new_uid
+    seen = set(old_df["Message-ID"].dropna())
+    new_df = new_df[~new_df["Message-ID"].isin(seen)]
 
+    out = pd.concat([new_df, old_df], ignore_index=True)
+    out = out.sort_values("Batch_ID", ascending=False, ignore_index=True)
 
-# --- Styling Functions ---
+    return out
 
-def get_batch_color(batch_id):
-    """
-    Returns a distinct background color from a predefined palette based on the batch_id.
-    Colors are chosen to be light enough for text, but distinct enough to see differences.
-    Red/Pink is avoided to ensure 'Failed Auth' stands out.
-    """
-    if batch_id == 0 or pd.isna(batch_id):
-        return ''
-    
-    # Distinct Palette (Light Blue, Light Green, Light Orange, Light Purple, Cyan, Yellow, Gray, Teal)
-    palette = [
-        '#E3F2FD', # Light Blue
-        '#E8F5E9', # Light Green
-        '#FFF3E0', # Light Orange
-        '#F3E5F5', # Light Purple
-        '#E0F7FA', # Light Cyan
-        '#FFF8E1', # Light Amber/Yellow
-        '#ECEFF1', # Light Blue Grey
-        '#E0F2F1', # Light Teal
-    ]
-    
-    # Cycle through the palette
-    color = palette[(int(batch_id) - 1) % len(palette)]
-    return f'background-color: {color}'
-
-def highlight_main_table(row):
-    """
-    Priority:
-    1. Failed Auth -> Red
-    2. Batch ID -> Distinct Palette Color
-    """
-    spf_status = row.get('SPF', '')
-    dkim_status = row.get('DKIM', '')
-    dmarc_status = row.get('DMARC', '')
-
-    failed = (spf_status != 'pass') or \
-             (dkim_status != 'pass') or \
-             (dmarc_status != 'pass')
+# ---------------- COLORS ----------------
+def row_style(row):
+    failed = (
+        row["SPF"] != "pass" or
+        row["DKIM"] != "pass" or
+        row["DMARC"] != "pass"
+    )
 
     if failed:
-        style = 'background-color: rgba(255, 0, 0, 0.2)'
-        return [style] * len(row)
+        return ['background-color: rgba(255,0,0,0.20)'] * len(row)
 
-    batch_id = row.get('Batch_ID', 0)
-    batch_style = get_batch_color(batch_id)
-    return [batch_style] * len(row)
+    return [''] * len(row)
 
-def highlight_failed_auth(row):
-    style = 'background-color: rgba(255, 0, 0, 0.2)'
-    return [style] * len(row)
+# ---------------- BUTTONS ----------------
+a, b = st.columns(2)
 
-
-# --- Action Buttons ---
-colA, colB = st.columns([1.5, 2])
-
-if IS_DEFAULT_TODAY:
-    initial_text = "📥 Fetch Today's Mails"
-    incremental_text = "🔄 Fetch New Mails"
-    range_text = "today's emails."
-else:
-    if IS_SINGLE_DAY:
-        range_label = f" ({START_DATE})"
-    else:
-        range_label = f" ({START_DATE} to {END_DATE})"
-    initial_text = f"🗓️ Fetch Range {range_label}"
-    incremental_text = f"🔄 Fetch New {range_label}"
-    range_text = f"emails in the range {range_label}."
-    
-button_label = incremental_text if not st.session_state.df.empty else initial_text
-button_help = f"Fetches {'new emails incrementally' if not st.session_state.df.empty else 'all emails'} for {range_text}."
-
-
-with colA:
-    if st.button(button_label, help=button_help):
+with a:
+    if st.button("📥 Fetch Emails"):
         st.session_state.batch_counter += 1
-        current_batch = st.session_state.batch_counter
-        use_uid_fetch = not st.session_state.df.empty and st.session_state.last_uid is not None
+        batch_id = st.session_state.batch_counter
 
-        with st.spinner(f"Fetching {range_text} (Batch #{current_batch})..."):
-            inbox_df, new_uid = fetch_emails(
-                START_DATE, 
-                END_DATE, 
-                "inbox", 
-                use_uid_since=use_uid_fetch, 
-                last_uid=st.session_state.last_uid,
-                current_batch_id=current_batch
-            )
-            spam_df, _ = fetch_emails(
-                START_DATE, 
-                END_DATE, 
-                "[Gmail]/Spam", 
-                use_uid_since=False,
-                current_batch_id=current_batch
-            )
-            df_new = pd.concat([inbox_df, spam_df], ignore_index=True)
-            
-            st.session_state.df, fetched_count, st.session_state.last_uid = process_fetch_results(
-                df_new, new_uid, st.session_state.df
-            )
-                
-            if fetched_count > 0:
-                st.success(f"✅ Fetched {fetched_count} new emails (Batch #{current_batch}).")
-            else:
-                st.info(f"No new unique emails found for {range_text}.")
+        use_uid = (
+            not st.session_state.df.empty and
+            st.session_state.last_uid is not None
+        )
 
-with colB:
-    spam_range_label = f" ({START_DATE} to {END_DATE})" if not IS_SINGLE_DAY else f" ({START_DATE})"
-    spam_button_label = f"🗑️ Fetch Spam Only"
+        with st.spinner("Fetching..."):
 
-    if st.button(spam_button_label, help=f"Fetches all unique spam emails."):
-         st.session_state.batch_counter += 1
-         current_batch = st.session_state.batch_counter
+            # MULTI THREAD
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as exe:
+                f1 = exe.submit(
+                    fetch_mailbox,
+                    "inbox",
+                    start_date,
+                    end_date,
+                    use_uid,
+                    st.session_state.last_uid,
+                    batch_id
+                )
 
-         with st.spinner(f"Fetching spam folder..."):
-            spam_df_new, _ = fetch_emails(
-                START_DATE, 
-                END_DATE, 
-                "[Gmail]/Spam", 
-                use_uid_since=False,
-                current_batch_id=current_batch
-            )
-            st.session_state.spam_df, fetched_count, _ = process_fetch_results(
-                spam_df_new, None, st.session_state.spam_df
-            )
-            
-            if fetched_count > 0:
-                st.success(f"✅ Added {fetched_count} unique spam emails.")
-            else:
-                st.info(f"No new unique spam emails found.")
+                f2 = exe.submit(
+                    fetch_mailbox,
+                    "[Gmail]/Spam",
+                    start_date,
+                    end_date,
+                    False,
+                    None,
+                    batch_id
+                )
 
-# --- Inbox + Spam Display ---
+                inbox_df, new_uid = f1.result()
+                spam_df, _ = f2.result()
+
+            all_new = pd.concat([inbox_df, spam_df], ignore_index=True)
+
+            st.session_state.df = merge_df(all_new, st.session_state.df)
+            st.session_state.last_uid = new_uid
+
+            st.success(f"Fetched {len(all_new)} emails.")
+
+with b:
+    if st.button("🗑️ Spam Only"):
+        st.session_state.batch_counter += 1
+        batch_id = st.session_state.batch_counter
+
+        spam_df, _ = fetch_mailbox(
+            "[Gmail]/Spam",
+            start_date,
+            end_date,
+            False,
+            None,
+            batch_id
+        )
+
+        st.session_state.spam_df = merge_df(spam_df, st.session_state.spam_df)
+        st.success(f"Fetched {len(spam_df)} spam emails.")
+
+# ---------------- PROCESSED ----------------
 st.subheader("📬 Processed Emails")
-# Batch_ID is included in columns for styling logic...
-inbox_cols = ["Subject", "Date", "Domain", "SPF", "DKIM", "DMARC", "Type", "Mailbox", "Batch_ID"] 
 
 if not st.session_state.df.empty:
-    display_df = st.session_state.df.reindex(columns=inbox_cols, fill_value="-")
-    styled_display_df = display_df.style.apply(highlight_main_table, axis=1)
-    
-    # ...but hidden via column_config in st.dataframe
+    cols = [
+        "Subject", "Date", "Domain",
+        "SPF", "DKIM", "DMARC",
+        "Type", "Sub ID", "Mailbox", "Batch_ID"
+    ]
+
+    show = st.session_state.df[cols]
+
     st.dataframe(
-        styled_display_df, 
+        show.style.apply(row_style, axis=1),
         use_container_width=True,
-        column_config={
-            "Batch_ID": None  # This hides the column entirely
-        }
+        column_config={"Batch_ID": None}
     )
-else:
-    st.info(f"No email data yet. Click '{initial_text}' to begin.")
 
-# --- Failed Auth Display ---
+# ---------------- FAILED AUTH ----------------
 if not st.session_state.df.empty:
-    failed_df = st.session_state.df[
+    failed = st.session_state.df[
         (st.session_state.df["SPF"] != "pass") |
         (st.session_state.df["DKIM"] != "pass") |
         (st.session_state.df["DMARC"] != "pass")
+    ].reset_index(drop=True)
+
+    if not failed.empty:
+        st.subheader("❌ Failed Auth Emails")
+
+        cols = [
+            "Subject", "Domain", "SPF",
+            "DKIM", "DMARC", "Type",
+            "Sub ID", "Mailbox"
+        ]
+
+        st.dataframe(
+            failed[cols].style.apply(
+                lambda x: ['background-color: rgba(255,0,0,0.20)'] * len(x),
+                axis=1
+            ),
+            use_container_width=True
+        )
+
+        st.info(f"Failed Rows Count: {len(failed)}")
+
+# ---------------- SPAM ----------------
+if not st.session_state.spam_df.empty:
+    st.subheader("🚫 Spam Emails")
+
+    cols = [
+        "Subject", "Date", "Domain",
+        "Type", "Sub ID", "Mailbox",
+        "Batch_ID"
     ]
 
-    if not failed_df.empty:
-        st.subheader("❌ Failed Auth Emails")
-        failed_cols = ["Subject", "Domain", "SPF", "DKIM", "DMARC", "Type", "Sub ID", "Mailbox"]
-        styled_failed_df = failed_df[failed_cols].style.apply(highlight_failed_auth, axis=1)
-        st.dataframe(styled_failed_df, use_container_width=True)
-    else:
-        st.success("✅ All fetched emails passed SPF, DKIM, and DMARC.")
-
-# --- Spam Folder Display ---
-if not st.session_state.spam_df.empty:
-    st.subheader("🚫 Spam Folder Emails")
-    spam_cols = ["Subject", "Date", "Domain", "Type", "Mailbox", "Batch_ID"]
-    display_spam_df = st.session_state.spam_df.reindex(columns=spam_cols, fill_value="-")
-    styled_spam_df = display_spam_df.style.apply(highlight_main_table, axis=1)
-    
     st.dataframe(
-        styled_spam_df, 
+        st.session_state.spam_df[cols],
         use_container_width=True,
-        column_config={
-            "Batch_ID": None # Hide Batch ID here too
-        }
+        column_config={"Batch_ID": None}
     )
