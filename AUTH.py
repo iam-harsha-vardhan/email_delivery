@@ -4,22 +4,36 @@ import email
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 import datetime
-import re
 import pandas as pd
+import re
 import base64
 import concurrent.futures
 
-# ---------------- PAGE ----------------
-st.set_page_config(page_title="Email Auth Checker", layout="wide")
-st.title("📧 Email Authentication Report (SPF / DKIM / DMARC)")
+# =====================================================
+# PAGE
+# =====================================================
+st.set_page_config(page_title="Enterprise Email Auth Checker", layout="wide")
+st.title("📧 Enterprise Email Authentication Checker")
 
+# =====================================================
+# CONSTANTS
+# =====================================================
 DF_COLS = [
-    "Subject", "Date", "SPF", "DKIM", "DMARC",
-    "Domain", "Type", "Sub ID", "Message-ID",
-    "Mailbox", "Batch_ID"
+    "Subject", "Date", "Domain",
+    "SPF", "DKIM", "DMARC",
+    "Type", "Sub ID",
+    "Mailbox", "Message-ID",
+    "Batch_ID"
 ]
 
-# ---------------- SESSION ----------------
+ID_RE = re.compile(
+    r'(GRM-[A-Za-z0-9._-]+|GMFP-[A-Za-z0-9._-]+|GTC-[A-Za-z0-9._-]+|GRTC-[A-Za-z0-9._-]+)',
+    re.I
+)
+
+# =====================================================
+# SESSION
+# =====================================================
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(columns=DF_COLS)
 
@@ -37,7 +51,9 @@ today = datetime.date.today()
 if "fetch_dates" not in st.session_state:
     st.session_state.fetch_dates = (today, today)
 
-# ---------------- UI ----------------
+# =====================================================
+# UI
+# =====================================================
 with st.container():
     c1, c2, c3, c4 = st.columns([3, 3, 2, 1])
 
@@ -70,10 +86,12 @@ with st.container():
             st.rerun()
 
 if not gmail_user or not gmail_pass:
-    st.warning("Enter Gmail + App Password")
+    st.warning("Enter Gmail Address and App Password")
     st.stop()
 
-# ---------------- HELPERS ----------------
+# =====================================================
+# HELPERS
+# =====================================================
 def decode_mime_words(s):
     if not s:
         return ""
@@ -88,6 +106,7 @@ def decode_mime_words(s):
             pass
     return out.strip()
 
+
 def format_date_ist(raw):
     try:
         dt = parsedate_to_datetime(raw)
@@ -97,31 +116,77 @@ def format_date_ist(raw):
     except:
         return raw
 
-def extract_subid(search_string, data):
-    m = re.search(
-        r'(GRM-[A-Za-z0-9._-]+|GMFP-[A-Za-z0-9._-]+|GTC-[A-Za-z0-9._-]+|GRTC-[A-Za-z0-9._-]+)',
-        search_string,
-        re.I
-    )
 
+def get_type(subid):
+    x = subid.lower()
+
+    if x.startswith("grm"):
+        return "FPR"
+    elif x.startswith("gmfp"):
+        return "FP"
+    elif x.startswith("gtc"):
+        return "FPTC"
+    elif x.startswith("grtc"):
+        return "FPRTC"
+    return "-"
+
+
+def safe_b64_decode(token):
+    token = token.strip()
+
+    if not token:
+        return ""
+
+    try:
+        pad = token + "=" * (-len(token) % 4)
+        return base64.b64decode(pad).decode("utf-8", errors="ignore")
+    except:
+        pass
+
+    try:
+        pad = token + "=" * (-len(token) % 4)
+        return base64.urlsafe_b64decode(pad).decode("utf-8", errors="ignore")
+    except:
+        pass
+
+    return ""
+
+
+def extract_subid_advanced(raw_text):
+    if not raw_text:
+        return "-", "-"
+
+    # direct hit
+    m = ID_RE.search(raw_text)
     if m:
         sid = m.group(1)
-        data["Sub ID"] = sid
+        return sid, get_type(sid)
 
-        x = sid.lower()
+    # split tokens
+    tokens = re.split(r'[\s<>()@._:;,\[\]{}]+', raw_text)
 
-        if x.startswith("grm"):
-            data["Type"] = "FPR"
-        elif x.startswith("gmfp"):
-            data["Type"] = "FP"
-        elif x.startswith("gtc"):
-            data["Type"] = "FPTC"
-        elif x.startswith("grtc"):
-            data["Type"] = "FPRTC"
+    for token in tokens:
+        if len(token) < 6:
+            continue
 
-        return True
+        dec = safe_b64_decode(token)
 
-    return False
+        if dec:
+            m = ID_RE.search(dec)
+            if m:
+                sid = m.group(1)
+                return sid, get_type(sid)
+
+            # double decode
+            dec2 = safe_b64_decode(dec)
+            if dec2:
+                m2 = ID_RE.search(dec2)
+                if m2:
+                    sid = m2.group(1)
+                    return sid, get_type(sid)
+
+    return "-", "-"
+
 
 def parse_email(msg, batch_id):
     raw_date = msg.get("Date", "")
@@ -129,19 +194,20 @@ def parse_email(msg, batch_id):
     data = {
         "Subject": decode_mime_words(msg.get("Subject", "No Subject")),
         "Date": format_date_ist(raw_date),
+        "Domain": "-",
         "SPF": "-",
         "DKIM": "-",
         "DMARC": "-",
-        "Domain": "-",
         "Type": "-",
         "Sub ID": "-",
+        "Mailbox": "-",
         "Message-ID": decode_mime_words(msg.get("Message-ID", "")),
         "Batch_ID": batch_id
     }
 
     headers = "".join(f"{k}: {v}\n" for k, v in msg.items())
 
-    # Domain
+    # domain
     m = re.search(r'smtp.mailfrom=([\w\.-]+)', headers, re.I)
     if m:
         data["Domain"] = m.group(1).lower()
@@ -151,7 +217,7 @@ def parse_email(msg, batch_id):
         if m2:
             data["Domain"] = m2.group(1).lower()
 
-    # Auth
+    # auth
     m = re.search(r'spf=(\w+)', headers, re.I)
     if m:
         data["SPF"] = m.group(1).lower()
@@ -164,36 +230,16 @@ def parse_email(msg, batch_id):
     if m:
         data["DMARC"] = m.group(1).lower()
 
-    # Plain extract
-    found = extract_subid(headers, data)
-
-    # Hidden base64 extract
-    if not found:
-        for _, val in msg.items():
-            if not val:
-                continue
-
-            parts = re.split(r'[._@<>]', str(val))
-
-            for part in parts:
-                if len(part) < 8:
-                    continue
-
-                try:
-                    pad = part + "=" * (-len(part) % 4)
-                    dec = base64.b64decode(pad).decode("utf-8", errors="ignore")
-
-                    if extract_subid(dec, data):
-                        break
-                except:
-                    pass
-
-            if data["Type"] != "-":
-                break
+    # subid
+    sid, typ = extract_subid_advanced(headers)
+    data["Sub ID"] = sid
+    data["Type"] = typ
 
     return data
 
-# ---------------- FETCH ----------------
+# =====================================================
+# FETCH
+# =====================================================
 def fetch_mailbox(mailbox, start_date, end_date, use_uid=False, last_uid=None, batch_id=0):
     rows = []
     new_last_uid = last_uid
@@ -239,7 +285,7 @@ def fetch_mailbox(mailbox, start_date, end_date, use_uid=False, last_uid=None, b
 
     return pd.DataFrame(rows, columns=DF_COLS), new_last_uid
 
-# ---------------- PROCESS ----------------
+
 def merge_df(new_df, old_df):
     if old_df.empty:
         return new_df
@@ -252,8 +298,10 @@ def merge_df(new_df, old_df):
 
     return out
 
-# ---------------- COLORS ----------------
-def row_style(row):
+# =====================================================
+# STYLE
+# =====================================================
+def style_rows(row):
     failed = (
         row["SPF"] != "pass" or
         row["DKIM"] != "pass" or
@@ -261,26 +309,27 @@ def row_style(row):
     )
 
     if failed:
-        return ['background-color: rgba(255,0,0,0.20)'] * len(row)
+        return ['background-color: rgba(255,0,0,0.22)'] * len(row)
 
     return [''] * len(row)
 
-# ---------------- BUTTONS ----------------
-a, b = st.columns(2)
+# =====================================================
+# BUTTONS
+# =====================================================
+b1, b2 = st.columns(2)
 
-with a:
+with b1:
     if st.button("📥 Fetch Emails"):
         st.session_state.batch_counter += 1
-        batch_id = st.session_state.batch_counter
+        batch = st.session_state.batch_counter
 
         use_uid = (
             not st.session_state.df.empty and
             st.session_state.last_uid is not None
         )
 
-        with st.spinner("Fetching..."):
+        with st.spinner("Fetching Inbox + Spam using Multi Threading..."):
 
-            # MULTI THREAD
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as exe:
                 f1 = exe.submit(
                     fetch_mailbox,
@@ -289,7 +338,7 @@ with a:
                     end_date,
                     use_uid,
                     st.session_state.last_uid,
-                    batch_id
+                    batch
                 )
 
                 f2 = exe.submit(
@@ -299,23 +348,23 @@ with a:
                     end_date,
                     False,
                     None,
-                    batch_id
+                    batch
                 )
 
                 inbox_df, new_uid = f1.result()
                 spam_df, _ = f2.result()
 
-            all_new = pd.concat([inbox_df, spam_df], ignore_index=True)
+            combined = pd.concat([inbox_df, spam_df], ignore_index=True)
 
-            st.session_state.df = merge_df(all_new, st.session_state.df)
+            st.session_state.df = merge_df(combined, st.session_state.df)
             st.session_state.last_uid = new_uid
 
-            st.success(f"Fetched {len(all_new)} emails.")
+            st.success(f"Fetched {len(combined)} Emails")
 
-with b:
-    if st.button("🗑️ Spam Only"):
+with b2:
+    if st.button("🗑️ Fetch Spam Only"):
         st.session_state.batch_counter += 1
-        batch_id = st.session_state.batch_counter
+        batch = st.session_state.batch_counter
 
         spam_df, _ = fetch_mailbox(
             "[Gmail]/Spam",
@@ -323,31 +372,40 @@ with b:
             end_date,
             False,
             None,
-            batch_id
+            batch
         )
 
-        st.session_state.spam_df = merge_df(spam_df, st.session_state.spam_df)
-        st.success(f"Fetched {len(spam_df)} spam emails.")
+        st.session_state.spam_df = merge_df(
+            spam_df,
+            st.session_state.spam_df
+        )
 
-# ---------------- PROCESSED ----------------
+        st.success(f"Fetched {len(spam_df)} Spam Emails")
+
+# =====================================================
+# PROCESSED EMAILS
+# =====================================================
 st.subheader("📬 Processed Emails")
 
 if not st.session_state.df.empty:
-    cols = [
+    show_cols = [
         "Subject", "Date", "Domain",
         "SPF", "DKIM", "DMARC",
-        "Type", "Sub ID", "Mailbox", "Batch_ID"
+        "Type", "Sub ID",
+        "Mailbox", "Batch_ID"
     ]
 
-    show = st.session_state.df[cols]
-
     st.dataframe(
-        show.style.apply(row_style, axis=1),
-        use_container_width=True,
-        column_config={"Batch_ID": None}
-    )
+    st.session_state.df[show_cols].style.apply(style_rows, axis=1),
+    use_container_width=True,
+    column_config={
+        "Batch_ID": None,
+        "Sub ID": None
+    })
 
-# ---------------- FAILED AUTH ----------------
+# =====================================================
+# FAILED AUTH
+# =====================================================
 if not st.session_state.df.empty:
     failed = st.session_state.df[
         (st.session_state.df["SPF"] != "pass") |
@@ -358,34 +416,33 @@ if not st.session_state.df.empty:
     if not failed.empty:
         st.subheader("❌ Failed Auth Emails")
 
-        cols = [
-            "Subject", "Domain", "SPF",
-            "DKIM", "DMARC", "Type",
-            "Sub ID", "Mailbox"
+        show_cols = [
+            "Subject", "Domain",
+            "SPF", "DKIM", "DMARC",
+            "Type", "Sub ID", "Mailbox"
         ]
 
         st.dataframe(
-            failed[cols].style.apply(
-                lambda x: ['background-color: rgba(255,0,0,0.20)'] * len(x),
-                axis=1
-            ),
+            failed[show_cols].style.apply(style_rows, axis=1),
             use_container_width=True
         )
 
-        st.info(f"Failed Rows Count: {len(failed)}")
+        st.info(f"Total Failed Rows: {len(failed)}")
 
-# ---------------- SPAM ----------------
+# =====================================================
+# SPAM
+# =====================================================
 if not st.session_state.spam_df.empty:
     st.subheader("🚫 Spam Emails")
 
-    cols = [
+    show_cols = [
         "Subject", "Date", "Domain",
-        "Type", "Sub ID", "Mailbox",
-        "Batch_ID"
+        "Type", "Sub ID",
+        "Mailbox", "Batch_ID"
     ]
 
     st.dataframe(
-        st.session_state.spam_df[cols],
+        st.session_state.spam_df[show_cols],
         use_container_width=True,
         column_config={"Batch_ID": None}
     )
