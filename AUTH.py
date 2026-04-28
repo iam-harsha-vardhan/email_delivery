@@ -69,35 +69,36 @@ def extract_subid(text):
     return '-', '-'
 
 def extract_domain(msg, headers):
+    # 1. Authentication-Results → smtp.mailfrom
     m = re.search(
-        r'Authentication-Results:.*?smtp.mailfrom=([\w\.-]+)',
+        r'smtp\.mailfrom=[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})',
         headers,
-        re.I | re.S
+        re.I
     )
-
     if m:
         return m.group(1).lower()
 
-    frm = decode_mime_words(msg.get("From", ""))
-
-    # First try full email inside angle brackets
-    m = re.search(r'<[^<>@]+@([\w\.-]+)>', frm)
-
-    if not m:
-        # fallback plain email without brackets
-        m = re.search(r'[\w\.-]+@([\w\.-]+)', frm)
-
+    # 2. Return-Path fallback
+    rp = msg.get('Return-Path', '')
+    m = re.search(
+        r'[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})',
+        rp,
+        re.I
+    )
     if m:
         return m.group(1).lower()
 
-    rp = msg.get("Return-Path", "")
-
-    m = re.search(r'@([\w\.-]+)', rp)
-
+    # 3. From header fallback
+    frm = decode_mime_words(msg.get('From', ''))
+    m = re.search(
+        r'[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})',
+        frm,
+        re.I
+    )
     if m:
         return m.group(1).lower()
 
-    return "-"
+    return '-'
 
 def parse_email(msg,batch):
     headers=''.join(f'{k}: {v}\n' for k,v in msg.items())
