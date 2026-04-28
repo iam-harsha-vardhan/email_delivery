@@ -134,9 +134,9 @@ def extract_id_details(search_string, data):
     Includes GRTC -> FPRTC mapping.
     """
     sub_id_match = re.search(
-        r'(GTC-[^@_]+|GMFP-[^@_]+|GRM-[^@_]+|GRTC-[^@_]+)', 
-        search_string, 
-        re.I
+    r'(GRM-[A-Za-z0-9._-]+|GMFP-[A-Za-z0-9._-]+|GTC-[A-Za-z0-9._-]+|GRTC-[A-Za-z0-9._-]+)',
+    search_string,
+    re.I
     )
 
     if sub_id_match:
