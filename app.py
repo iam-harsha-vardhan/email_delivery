@@ -120,40 +120,49 @@ def format_date_to_ist_string(raw_date):
     return formatted, dt_ist_naive
 
 def extract_subid_from_msg(msg):
-    msg_id_raw = decode_mime_words(msg.get("Message-ID", "") or msg.get("Message-Id", "") or "")
+    msg_id_raw = decode_mime_words(
+        msg.get("Message-ID", "") or msg.get("Message-Id", "") or ""
+    )
+
+    prefixes = ("GRM-", "GMFP-", "GTC-", "GRTC-")
+
     if msg_id_raw:
-        tokens = re.split(r'[_\s]+', msg_id_raw)
-        for t in tokens:
-            maybe = find_subid_in_text(t)
-            if maybe: return maybe, map_id_to_type(maybe)
-            decoded = try_base64_variants(t)
+
+        # split all possible separators
+        tokens = re.split(r'[._<>\s@]+', msg_id_raw)
+
+        for token in tokens:
+
+            if not token or len(token) < 6:
+                continue
+
+            # direct plain token
+            if token.upper().startswith(prefixes):
+                return token.strip(), map_id_to_type(token.strip())
+
+            # decode token only
+            decoded = try_base64_variants(token)
+
             if decoded:
-                m2 = find_subid_in_text(decoded)
-                if m2: return m2, map_id_to_type(m2)
-    headers_str = " ".join(f"{h}:{v}" for h,v in msg.items())
-    maybe = find_subid_in_text(headers_str)
-    if maybe: return maybe, map_id_to_type(maybe)
-    try:
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            if ctype in ("text/plain","text/html"):
-                payload = part.get_payload(decode=True)
-                if not payload: continue
-                try:
-                    text = payload.decode(part.get_content_charset() or 'utf-8', errors='ignore')
-                except Exception:
-                    text = str(payload)
-                maybe = find_subid_in_text(text)
-                if maybe: return maybe, map_id_to_type(maybe)
-                tokens = re.split(r'[^A-Za-z0-9_\-+/=]', text)
-                for t in tokens:
-                    if len(t) < 12: continue
-                    dec = try_base64_variants(t)
-                    if dec:
-                        m2 = find_subid_in_text(dec)
-                        if m2: return m2, map_id_to_type(m2)
-    except Exception:
-        pass
+                decoded = decoded.strip()
+
+                # exact decoded token
+                if decoded.upper().startswith(prefixes):
+                    return decoded, map_id_to_type(decoded)
+
+                # fallback regex inside token
+                m = find_subid_in_text(decoded)
+                if m:
+                    return m, map_id_to_type(m)
+
+    # fallback headers
+    headers_str = " ".join(f"{h}:{v}" for h, v in msg.items())
+
+    m = find_subid_in_text(headers_str)
+
+    if m:
+        return m, map_id_to_type(m)
+
     return None, "-"
 
 def parse_fetch_parts_for_uid_and_date(fetch_response_parts) -> List[tuple]:
