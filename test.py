@@ -1,755 +1,550 @@
+# ============================================
+# app.py
+# Hourly Deliverability Comparison Dashboard
+# Streamlit Single File App
+# ============================================
+
 import streamlit as st
-import imaplib
-import email
-import datetime
 import pandas as pd
-import pytz
-import re
-import base64
-import concurrent.futures
+import os
+import json
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+import plotly.express as px
 
-from email.header import decode_header
-from email.utils import parsedate_to_datetime
-
-# =========================================================
+# ============================================
 # PAGE CONFIG
-# =========================================================
+# ============================================
 
 st.set_page_config(
-    page_title="Enterprise Multi Account Email Monitor",
-    layout="wide"
+    page_title="Deliverability Dashboard",
+    layout="wide",
+    page_icon="📊"
 )
 
-st.title("📧 Enterprise Multi Account Email Monitoring Platform")
+# ============================================
+# CUSTOM CSS
+# ============================================
 
-# =========================================================
-# CONSTANTS
-# =========================================================
+st.markdown("""
+<style>
 
-UID_SCAN_LIMIT = 3000
-CHUNK_SIZE = 200
-MAX_WORKERS = 10
-
-MAILBOXES = {
-    "Inbox": "inbox",
-    "Spam": "[Gmail]/Spam"
+.main {
+    background-color: #0e1117;
 }
 
-ID_RE = re.compile(
-r'\b(GRM-[A-Za-z0-9.\-]+|GMFP-[A-Za-z0-9.\-]+|GTC-[A-Za-z0-9.\-]+|GRTC-[A-Za-z0-9.\-]+)\b',
-re.I
+.block-container {
+    padding-top: 1rem;
+}
+
+.metric-card {
+    background: linear-gradient(135deg,#111827,#1f2937);
+    border-radius: 18px;
+    padding: 18px;
+    border: 1px solid #374151;
+    box-shadow: 0px 0px 12px rgba(0,0,0,0.4);
+}
+
+.metric-title {
+    color: #9CA3AF;
+    font-size: 14px;
+}
+
+.metric-value {
+    color: white;
+    font-size: 34px;
+    font-weight: bold;
+}
+
+.section-title {
+    color: white;
+    font-size: 26px;
+    font-weight: bold;
+    margin-top: 20px;
+}
+
+.compare-card {
+    background-color: #111827;
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 12px;
+    border: 1px solid #2d3748;
+}
+
+.bar-container {
+    width: 100%;
+    height: 34px;
+    display: flex;
+    border-radius: 10px;
+    overflow: hidden;
+    margin-top: 10px;
+    margin-bottom: 8px;
+}
+
+.green-bar {
+    height: 100%;
+    background: linear-gradient(90deg,#16a34a,#22c55e);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-weight: bold;
+    font-size: 14px;
+}
+
+.red-bar {
+    height: 100%;
+    background: linear-gradient(90deg,#dc2626,#ef4444);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-weight: bold;
+    font-size: 14px;
+}
+
+.small-text {
+    color: #9CA3AF;
+    font-size: 13px;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+# ============================================
+# DATA STORAGE
+# ============================================
+
+DATA_FOLDER = "stored_reports"
+
+if not os.path.exists(DATA_FOLDER):
+    os.makedirs(DATA_FOLDER)
+
+# ============================================
+# HEADER
+# ============================================
+
+st.markdown("""
+<div class='section-title'>
+🚀 Deliverability Intelligence Dashboard
+</div>
+""", unsafe_allow_html=True)
+
+# ============================================
+# SIDEBAR
+# ============================================
+
+st.sidebar.header("📂 Upload Hourly Report")
+
+selected_date = st.sidebar.date_input(
+    "Select Report Date",
+    datetime.now()
 )
 
-# =========================================================
-# SESSION STATE
-# =========================================================
+hour_options = [
+    "4:30 PM",
+    "5:30 PM",
+    "6:30 PM",
+    "7:30 PM",
+    "8:30 PM",
+    "9:30 PM",
+    "10:30 PM"
+]
 
-if "accounts_df" not in st.session_state:
-    st.session_state.accounts_df = pd.DataFrame([
-        {"Email": "", "Password": ""}
-    ])
+selected_hour = st.sidebar.selectbox(
+    "Select Hour",
+    hour_options
+)
 
-if "emails_df" not in st.session_state:
-    st.session_state.emails_df = pd.DataFrame()
+uploaded_file = st.sidebar.file_uploader(
+    "Upload CSV or Excel",
+    type=["csv", "xlsx"]
+)
 
-if "last_uid_map" not in st.session_state:
-    st.session_state.last_uid_map = {}
+# ============================================
+# SAVE REPORT
+# ============================================
 
-# =========================================================
-# HELPERS
-# =========================================================
+def save_uploaded_report(df, report_date, report_hour):
 
-def decode_mime_words(s):
+    date_str = report_date.strftime("%Y-%m-%d")
 
-    if not s:
-        return ""
+    filename = f"{date_str}_{report_hour.replace(':','-').replace(' ','_')}.csv"
 
-    decoded = ""
+    path = os.path.join(DATA_FOLDER, filename)
 
-    for word, enc in decode_header(s):
+    df.to_csv(path, index=False)
 
-        if isinstance(word, bytes):
+# ============================================
+# LOAD REPORT
+# ============================================
 
-            try:
-                decoded += word.decode(
-                    enc or 'utf-8',
-                    errors='ignore'
-                )
+def load_report(report_date, report_hour):
 
-            except:
-                decoded += word.decode(
-                    'utf-8',
-                    errors='ignore'
-                )
+    date_str = report_date.strftime("%Y-%m-%d")
 
-        else:
-            decoded += word
+    filename = f"{date_str}_{report_hour.replace(':','-').replace(' ','_')}.csv"
 
-    return decoded.strip()
+    path = os.path.join(DATA_FOLDER, filename)
 
-# =========================================================
-
-def format_date_to_ist(raw_date):
-
-    if not raw_date:
-        return "-"
-
-    try:
-        dt = parsedate_to_datetime(raw_date)
-
-        if dt.tzinfo is None:
-            dt = dt.replace(
-                tzinfo=datetime.timezone.utc
-            )
-
-        ist = pytz.timezone("Asia/Kolkata")
-
-        dt_ist = dt.astimezone(ist)
-
-        return dt_ist.strftime(
-            "%d-%b-%Y %I:%M %p"
-        )
-
-    except:
-        return raw_date
-
-# =========================================================
-
-def extract_domain(address):
-
-    if not address:
-        return "-"
-
-    m = re.search(
-        r'@([\w\.-]+)',
-        address
-    )
-
-    return m.group(1).lower() if m else "-"
-
-# =========================================================
-# AUTH EXTRACTION
-# =========================================================
-
-def extract_auth_results(msg):
-
-    auth = (
-        msg.get("Authentication-Results", "")
-        or " ".join(
-            f"{h}: {v}"
-            for h, v in msg.items()
-        )
-    )
-
-    spf = dkim = dmarc = 'none'
-
-    m_spf = re.search(
-        r'spf=(\w+)',
-        auth,
-        re.I
-    )
-
-    m_dkim = re.search(
-        r'dkim=(\w+)',
-        auth,
-        re.I
-    )
-
-    m_dmarc = re.search(
-        r'dmarc=(\w+)',
-        auth,
-        re.I
-    )
-
-    if m_spf:
-        spf = m_spf.group(1).lower()
-
-    if m_dkim:
-        dkim = m_dkim.group(1).lower()
-
-    if m_dmarc:
-        dmarc = m_dmarc.group(1).lower()
-
-    return spf, dkim, dmarc
-
-# =========================================================
-# SUBID ENGINE (YOUR BEST VERSION)
-# =========================================================
-
-def map_id_to_type(sub_id):
-
-    if not sub_id:
-        return "-"
-
-    lid = sub_id.lower()
-
-    if lid.startswith('grm'):
-        return 'FPR'
-
-    if lid.startswith('gmfp'):
-        return 'FP'
-
-    if lid.startswith('gtc'):
-        return 'FPTC'
-
-    if lid.startswith('grtc'):
-        return 'FPRTC'
-
-    return "-"
-
-# =========================================================
-
-def try_base64_variants(s):
-
-    if not s or len(s) < 4:
-        return None
-
-    s = s.strip()
-
-    if s.startswith('<') and s.endswith('>'):
-        s = s[1:-1]
-
-    for decoder in (
-        base64.b64decode,
-        base64.urlsafe_b64decode
-    ):
-
-        for pad in range(0, 4):
-
-            try:
-
-                cand = s + ('=' * pad)
-
-                decoded = decoder(cand)
-
-                try:
-                    text = decoded.decode(
-                        'utf-8',
-                        errors='ignore'
-                    )
-
-                except:
-                    continue
-
-                if text and text.strip():
-                    return text
-
-            except:
-                continue
+    if os.path.exists(path):
+        return pd.read_csv(path)
 
     return None
 
-# =========================================================
+# ============================================
+# AUTO DELETE OLD FILES (30 DAYS)
+# ============================================
 
-def find_subid_in_text(txt):
+def cleanup_old_reports():
 
-    if not txt:
-        return None
+    now = datetime.now()
 
-    m = ID_RE.search(txt)
+    for file in os.listdir(DATA_FOLDER):
 
-    return m.group(1) if m else None
+        path = os.path.join(DATA_FOLDER, file)
 
-# =========================================================
+        created_time = datetime.fromtimestamp(os.path.getctime(path))
 
-def extract_subid_from_msg(msg):
+        if now - created_time > timedelta(days=30):
+            os.remove(path)
 
-    msg_id_raw = decode_mime_words(
-        msg.get("Message-ID", "")
-        or msg.get("Message-Id", "")
-        or ""
+cleanup_old_reports()
+
+# ============================================
+# LOAD FILE
+# ============================================
+
+if uploaded_file:
+
+    if uploaded_file.name.endswith(".csv"):
+        current_df = pd.read_csv(uploaded_file)
+    else:
+        current_df = pd.read_excel(uploaded_file)
+
+    save_uploaded_report(
+        current_df,
+        selected_date,
+        selected_hour
     )
 
-    prefixes = (
-        "GRM-",
-        "GMFP-",
-        "GTC-",
-        "GRTC-"
+    st.sidebar.success("Report Saved Successfully")
+
+else:
+
+    current_df = load_report(
+        selected_date,
+        selected_hour
     )
 
-    if msg_id_raw:
-
-        tokens = re.split(
-            r'[._<>\s@]+',
-            msg_id_raw
-        )
-
-        for token in tokens:
-
-            if not token or len(token) < 6:
-                continue
-
-            if token.upper().startswith(prefixes):
-
-                return (
-                    token.strip(),
-                    map_id_to_type(token.strip())
-                )
-
-            decoded = try_base64_variants(token)
-
-            if decoded:
-
-                decoded = decoded.strip()
-
-                if decoded.upper().startswith(prefixes):
-
-                    return (
-                        decoded,
-                        map_id_to_type(decoded)
-                    )
-
-                m = find_subid_in_text(decoded)
-
-                if m:
-
-                    return (
-                        m,
-                        map_id_to_type(m)
-                    )
-
-    headers_str = " ".join(
-        f"{h}:{v}"
-        for h, v in msg.items()
-    )
-
-    m = find_subid_in_text(headers_str)
-
-    if m:
-
-        return (
-            m,
-            map_id_to_type(m)
-        )
-
-    return "-", "-"
-
-# =========================================================
-# FETCH ENGINE
-# =========================================================
-
-def fetch_emails(
-    user,
-    password,
-    mailbox_name,
-    mailbox_path,
-    fetch_mode,
-    fetch_n
-):
-
-    rows = []
-
-    try:
-
-        imap = imaplib.IMAP4_SSL(
-            "imap.gmail.com"
-        )
-
-        imap.login(user, password)
-
-        imap.select(mailbox_path)
-
-        # ============================================
-        # FETCH MODES
-        # ============================================
-
-        if fetch_mode == "Last N Emails":
-
-            status, data = imap.uid(
-                'search',
-                None,
-                'ALL'
-            )
-
-            uids = data[0].split()[-int(fetch_n):]
-
-        elif fetch_mode == "Last N Hours":
-
-            status, data = imap.uid(
-                'search',
-                None,
-                'ALL'
-            )
-
-            all_uids = data[0].split()
-
-            uids = all_uids[-UID_SCAN_LIMIT:]
-
-        elif fetch_mode == "Last N Minutes":
-
-            status, data = imap.uid(
-                'search',
-                None,
-                'ALL'
-            )
-
-            all_uids = data[0].split()
-
-            uids = all_uids[-UID_SCAN_LIMIT:]
-
-        elif fetch_mode == "Last N Days":
-
-            since_date = (
-                datetime.datetime.now()
-                - datetime.timedelta(days=int(fetch_n))
-            ).strftime("%d-%b-%Y")
-
-            status, data = imap.uid(
-                'search',
-                None,
-                f'(SINCE "{since_date}")'
-            )
-
-            uids = data[0].split()
-
-        else:
-
-            status, data = imap.uid(
-                'search',
-                None,
-                'ALL'
-            )
-
-            uids = data[0].split()[-100:]
-
-        # ============================================
-        # FETCH EMAILS
-        # ============================================
-
-        for uid in uids:
-
-            try:
-
-                uid_s = uid.decode()
-
-                res, msg_data = imap.uid(
-                    'fetch',
-                    uid,
-                    '(BODY.PEEK[HEADER])'
-                )
-
-                for part in msg_data:
-
-                    if not isinstance(part, tuple):
-                        continue
-
-                    msg = email.message_from_bytes(
-                        part[1]
-                    )
-
-                    subject = decode_mime_words(
-                        msg.get("Subject", "")
-                    )
-
-                    from_h = decode_mime_words(
-                        msg.get("From", "")
-                    )
-
-                    domain = extract_domain(
-                        from_h
-                    )
-
-                    spf, dkim, dmarc = (
-                        extract_auth_results(msg)
-                    )
-
-                    subid, sub_type = (
-                        extract_subid_from_msg(msg)
-                    )
-
-                    auth_result = (
-                        "PASS"
-                        if (
-                            spf == "pass"
-                            and dkim == "pass"
-                            and dmarc == "pass"
-                        )
-                        else "FAIL"
-                    )
-
-                    rows.append({
-
-                        "UID": uid_s,
-
-                        "Account": user,
-
-                        "Mailbox": mailbox_name,
-
-                        "Subject": subject,
-
-                        "From": from_h,
-
-                        "Domain": domain,
-
-                        "SPF": spf,
-
-                        "DKIM": dkim,
-
-                        "DMARC": dmarc,
-
-                        "Auth Result": auth_result,
-
-                        "Sub ID": subid,
-
-                        "Type": sub_type,
-
-                        "Message-ID":
-                            decode_mime_words(
-                                msg.get(
-                                    "Message-ID",
-                                    ""
-                                )
-                            ),
-
-                        "Date":
-                            format_date_to_ist(
-                                msg.get(
-                                    "Date",
-                                    ""
-                                )
-                            )
-                    })
-
-            except:
-                continue
-
-        imap.logout()
-
-    except Exception as e:
-
-        st.error(f"{user}: {e}")
-
-    return pd.DataFrame(rows)
-
-# =========================================================
-# ACCOUNT UI
-# =========================================================
-
-st.subheader("📋 Multi Account Credentials")
-
-accounts_df = st.data_editor(
-    st.session_state.accounts_df,
-    num_rows="dynamic",
-    use_container_width=True,
-    hide_index=True
+# ============================================
+# YESTERDAY DATA
+# ============================================
+
+yesterday_date = selected_date - timedelta(days=1)
+
+yesterday_df = load_report(
+    yesterday_date,
+    selected_hour
 )
 
-st.session_state.accounts_df = accounts_df
+# ============================================
+# VALIDATION
+# ============================================
 
-# =========================================================
-# FETCH CONTROLS
-# =========================================================
+if current_df is None:
 
-st.subheader("⚙ Fetch Controls")
+    st.warning("Upload current report")
 
-c1, c2, c3, c4 = st.columns(4)
+    st.stop()
 
-with c1:
+if yesterday_df is None:
 
-    fetch_mode = st.selectbox(
-        "Fetch Mode",
-        [
-            "Last N Emails",
-            "Last N Hours",
-            "Last N Minutes",
-            "Last N Days"
+    st.warning("Yesterday report not available")
+
+# ============================================
+# COLUMN STANDARDIZATION
+# ============================================
+
+rename_map = {
+    "Genuine Unique Opens": "GUO",
+    "Genuine Open Rate": "GOR",
+    "Unique Unsubs": "Unsubs"
+}
+
+current_df.rename(columns=rename_map, inplace=True)
+
+if yesterday_df is not None:
+    yesterday_df.rename(columns=rename_map, inplace=True)
+
+# ============================================
+# KPI TOTALS
+# ============================================
+
+def get_total(df, column):
+
+    if column not in df.columns:
+        return 0
+
+    return round(df[column].sum(), 2)
+
+today_sent = get_total(current_df, "Sent")
+today_delivered = get_total(current_df, "Delivered")
+today_guo = get_total(current_df, "GUO")
+today_gor = round(current_df["GOR"].mean(), 2)
+today_unsubs = get_total(current_df, "Unsubs")
+today_unsub_rate = round(current_df["Unsub Rate"].mean(), 2)
+
+if yesterday_df is not None:
+
+    y_sent = get_total(yesterday_df, "Sent")
+    y_delivered = get_total(yesterday_df, "Delivered")
+    y_guo = get_total(yesterday_df, "GUO")
+    y_gor = round(yesterday_df["GOR"].mean(), 2)
+    y_unsubs = get_total(yesterday_df, "Unsubs")
+    y_unsub_rate = round(yesterday_df["Unsub Rate"].mean(), 2)
+
+else:
+
+    y_sent = y_delivered = y_guo = y_gor = y_unsubs = y_unsub_rate = 0
+
+# ============================================
+# KPI CARDS
+# ============================================
+
+st.markdown("---")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+
+    st.markdown(f"""
+    <div class='metric-card'>
+        <div class='metric-title'>📨 Sent</div>
+        <div class='metric-value'>{today_sent:,}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col2:
+
+    st.markdown(f"""
+    <div class='metric-card'>
+        <div class='metric-title'>👀 GUO</div>
+        <div class='metric-value'>{today_guo:,}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col3:
+
+    st.markdown(f"""
+    <div class='metric-card'>
+        <div class='metric-title'>📈 GOR</div>
+        <div class='metric-value'>{today_gor}%</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ============================================
+# DOMINANCE BAR
+# ============================================
+
+def comparison_bar(today, yesterday, reverse=False):
+
+    if today == 0 and yesterday == 0:
+        return ""
+
+    maximum = max(today, yesterday)
+
+    today_width = int((today / maximum) * 100)
+    yesterday_width = int((yesterday / maximum) * 100)
+
+    if reverse:
+
+        today_good = today < yesterday
+
+    else:
+
+        today_good = today > yesterday
+
+    if today_good:
+
+        today_class = "green-bar"
+        yesterday_class = "red-bar"
+
+    else:
+
+        today_class = "red-bar"
+        yesterday_class = "green-bar"
+
+    html = f"""
+    <div class='bar-container'>
+
+        <div class='{today_class}'
+            style='width:{today_width}%'>
+            {today}
+        </div>
+
+        <div class='{yesterday_class}'
+            style='width:{yesterday_width}%'>
+            {yesterday}
+        </div>
+
+    </div>
+    """
+
+    return html
+
+# ============================================
+# USERGROUP COMPARISON
+# ============================================
+
+st.markdown("---")
+
+st.markdown("""
+<div class='section-title'>
+📊 Usergroup Comparison
+</div>
+""", unsafe_allow_html=True)
+
+if yesterday_df is not None:
+
+    groups = current_df["Usergroup"].unique()
+
+    for group in groups:
+
+        today_row = current_df[
+            current_df["Usergroup"] == group
         ]
-    )
 
-with c2:
-
-    fetch_n = st.number_input(
-        "Value",
-        min_value=1,
-        value=10
-    )
-
-with c3:
-
-    mailbox_selection = st.multiselect(
-        "Mailbox",
-        ["Inbox", "Spam"],
-        default=["Inbox", "Spam"]
-    )
-
-with c4:
-
-    auth_filter = st.multiselect(
-        "Auth Filter",
-        ["PASS", "FAIL"],
-        default=["PASS", "FAIL"]
-    )
-
-# =========================================================
-# FETCH BUTTON
-# =========================================================
-
-if st.button("📥 Fetch Emails"):
-
-    frames = []
-
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
-
-        futures = []
-
-        for _, row in accounts_df.iterrows():
-
-            user = str(
-                row["Email"]
-            ).strip()
-
-            password = str(
-                row["Password"]
-            ).strip()
-
-            if not user or not password:
-                continue
-
-            for mb in mailbox_selection:
-
-                futures.append(
-
-                    executor.submit(
-                        fetch_emails,
-                        user,
-                        password,
-                        mb,
-                        MAILBOXES[mb],
-                        fetch_mode,
-                        fetch_n
-                    )
-                )
-
-        for future in concurrent.futures.as_completed(
-            futures
-        ):
-
-            df = future.result()
-
-            if not df.empty:
-                frames.append(df)
-
-    if frames:
-
-        st.session_state.emails_df = pd.concat(
-            frames,
-            ignore_index=True
-        )
-
-# =========================================================
-# DISPLAY
-# =========================================================
-
-if not st.session_state.emails_df.empty:
-
-    df = st.session_state.emails_df.copy()
-
-    # =============================================
-    # FILTERS
-    # =============================================
-
-    if mailbox_selection:
-
-        df = df[
-            df["Mailbox"].isin(
-                mailbox_selection
-            )
+        y_row = yesterday_df[
+            yesterday_df["Usergroup"] == group
         ]
 
-    if auth_filter:
+        if len(today_row) == 0 or len(y_row) == 0:
+            continue
 
-        df = df[
-            df["Auth Result"].isin(
-                auth_filter
-            )
-        ]
+        today_row = today_row.iloc[0]
+        y_row = y_row.iloc[0]
 
-    # =============================================
-    # METRICS
-    # =============================================
+        st.markdown(f"""
+        <div class='compare-card'>
 
-    total = len(df)
+        <h4 style='color:white'>
+        {group}
+        </h4>
 
-    passed = len(
-        df[df["Auth Result"] == "PASS"]
-    )
+        <div class='small-text'>
+        GOR Comparison
+        </div>
 
-    failed = len(
-        df[df["Auth Result"] == "FAIL"]
-    )
+        {comparison_bar(
+            round(today_row['GOR'],2),
+            round(y_row['GOR'],2)
+        )}
 
-    inbox = len(
-        df[df["Mailbox"] == "Inbox"]
-    )
+        <div class='small-text'>
+        GUO Comparison
+        </div>
 
-    spam = len(
-        df[df["Mailbox"] == "Spam"]
-    )
+        {comparison_bar(
+            int(today_row['GUO']),
+            int(y_row['GUO'])
+        )}
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+        <div class='small-text'>
+        Unsub Comparison
+        </div>
 
-    m1.metric("Total", total)
-    m2.metric("Passed", passed)
-    m3.metric("Failed", failed)
-    m4.metric("Inbox", inbox)
-    m5.metric("Spam", spam)
+        {comparison_bar(
+            int(today_row['Unsubs']),
+            int(y_row['Unsubs']),
+            reverse=True
+        )}
 
-    # =============================================
-    # FAILED EMAILS
-    # =============================================
+        </div>
+        """, unsafe_allow_html=True)
 
-    failed_df = df[
-        df["Auth Result"] == "FAIL"
+# ============================================
+# TREND GRAPH
+# ============================================
+
+st.markdown("---")
+
+st.markdown("""
+<div class='section-title'>
+📈 Overall Trend
+</div>
+""", unsafe_allow_html=True)
+
+metrics = pd.DataFrame({
+    "Metric": ["Sent","Delivered","GUO","GOR","Unsubs"],
+    "Today": [
+        today_sent,
+        today_delivered,
+        today_guo,
+        today_gor,
+        today_unsubs
+    ],
+    "Yesterday": [
+        y_sent,
+        y_delivered,
+        y_guo,
+        y_gor,
+        y_unsubs
     ]
+})
 
-    if not failed_df.empty:
+fig = go.Figure()
 
-        st.subheader("❌ Failed Emails")
+fig.add_trace(go.Bar(
+    x=metrics["Metric"],
+    y=metrics["Today"],
+    name="Today"
+))
 
-        st.dataframe(
-            failed_df,
-            use_container_width=True
-        )
+fig.add_trace(go.Bar(
+    x=metrics["Metric"],
+    y=metrics["Yesterday"],
+    name="Yesterday"
+))
 
-    # =============================================
-    # MAIN TABLE
-    # =============================================
+fig.update_layout(
+    template="plotly_dark",
+    barmode="group",
+    height=500
+)
 
-    st.subheader(
-        "📬 Enterprise Email Intelligence Table"
-    )
+st.plotly_chart(fig, use_container_width=True)
 
-    st.dataframe(
-        df.sort_values(
-            by="Date",
-            ascending=False
-        ),
-        use_container_width=True
-    )
+# ============================================
+# STORED REPORTS
+# ============================================
 
-    # =============================================
-    # EXPORT
-    # =============================================
+st.markdown("---")
 
-    csv = df.to_csv(
-        index=False
-    ).encode('utf-8')
+st.markdown("""
+<div class='section-title'>
+🗂 Stored Reports
+</div>
+""", unsafe_allow_html=True)
 
-    st.download_button(
-        "⬇ Download CSV",
-        csv,
-        file_name="enterprise_email_monitor.csv",
-        mime="text/csv"
-    )
+files = sorted(os.listdir(DATA_FOLDER), reverse=True)
 
-# =========================================================
-# CLEAR
-# =========================================================
+report_df = pd.DataFrame({
+    "Stored Files": files
+})
 
-if st.button("🗑 Clear Data"):
+st.dataframe(
+    report_df,
+    use_container_width=True,
+    height=250
+)
 
-    st.session_state.emails_df = pd.DataFrame()
+# ============================================
+# FOOTER
+# ============================================
 
-    st.success("Cleared")
+st.markdown("---")
+
+st.caption(
+    "⚡ Streamlit Deliverability Intelligence Dashboard"
+)
