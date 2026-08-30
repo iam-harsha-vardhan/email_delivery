@@ -44,20 +44,30 @@ DF_COLS = [
 
 
 # ============================================================
-# SUB-ID PATTERN
+# SUB-ID REGEX
+#
+# IMPORTANT:
+# "_" is intentionally NOT included at the end of the
+# Sub-ID pattern so:
+#
+# GMFP-NL-SEXPT-997992-20260830-S-14539128-1_997992...
+#
+# becomes:
+#
+# GMFP-NL-SEXPT-997992-20260830-S-14539128-1
 # ============================================================
 
 ID_RE = re.compile(
-    r'(GRM-[A-Za-z0-9._-]+|'
-    r'GMFP-[A-Za-z0-9._-]+|'
-    r'GTC-[A-Za-z0-9._-]+|'
-    r'GRTC-[A-Za-z0-9._-]+)',
+    r'(GRM-[A-Za-z0-9.-]+|'
+    r'GMFP-[A-Za-z0-9.-]+|'
+    r'GTC-[A-Za-z0-9.-]+|'
+    r'GRTC-[A-Za-z0-9.-]+)',
     re.I
 )
 
 
 # ============================================================
-# BLAST-ID PATTERN
+# BLAST-ID REGEX
 #
 # Examples:
 #
@@ -65,12 +75,12 @@ ID_RE = re.compile(
 # 07951351kek7
 # 30638613bap5
 # 748499244e53
-# 001038745yhf
+# 10685743xz87
 #
-# General observed structure:
+# Observed structure:
 # - exactly 12 characters
-# - first character must be a digit
-# - remaining 11 characters are alphanumeric
+# - first character = digit
+# - remaining characters = alphanumeric
 # ============================================================
 
 BLAST_ID_RE = re.compile(
@@ -98,7 +108,7 @@ for k, v in {
 
 
 # ============================================================
-# MIME WORD DECODER
+# DECODE MIME WORDS
 # ============================================================
 
 def decode_mime_words(s):
@@ -157,7 +167,7 @@ def format_date_ist(raw):
 
 
 # ============================================================
-# EMAIL TYPE
+# TYPE
 # ============================================================
 
 def get_type(s):
@@ -190,22 +200,17 @@ def safe_b64(token):
 
     token = token.strip()
 
-    # Remove whitespace introduced by wrapping
+    # Remove whitespace/newlines
     token = re.sub(
         r'\s+',
         '',
         token
     )
 
+    # Standard Base64 and Base64URL variants
     variants = [
         token,
-        token.replace(
-            '-',
-            '+'
-        ).replace(
-            '_',
-            '/'
-        )
+        token.replace('-', '+').replace('_', '/')
     ]
 
     for value in variants:
@@ -232,7 +237,7 @@ def safe_b64(token):
 
         except Exception:
 
-            pass
+            continue
 
     return ''
 
@@ -244,11 +249,10 @@ def safe_b64(token):
 def extract_subid(text):
 
     if not text:
-
         return '-', '-'
 
     # --------------------------------------------------------
-    # Direct Sub ID
+    # Direct search
     # --------------------------------------------------------
 
     m = ID_RE.search(text)
@@ -263,18 +267,17 @@ def extract_subid(text):
         )
 
     # --------------------------------------------------------
-    # Try separated tokens
+    # Decode separated Base64 pieces
     # --------------------------------------------------------
 
     tokens = re.split(
-        r'[\s<>()@._:;,\[\]{}]+',
+        r'[\s<>()@._:;,\[\]{}|]+',
         text
     )
 
     for token in tokens:
 
         if len(token) < 6:
-
             continue
 
         decoded = safe_b64(token)
@@ -304,7 +307,6 @@ def extract_subid(text):
 def is_blast_id(value):
 
     if not value:
-
         return False
 
     value = value.strip()
@@ -317,109 +319,159 @@ def is_blast_id(value):
 
 
 # ============================================================
-# EXTRACT POSSIBLE BASE64-LIKE TOKENS
+# GET MESSAGE-ID LOCAL PART
 #
-# We intentionally do NOT assume "_".
+# Example:
+#
+# Njg5Njgy_RVFEVFQ=_VDA4NDg0...
+#                         |
+#                         domain removed
 # ============================================================
 
-def extract_possible_tokens(text):
+def get_message_id_local_part(message_id):
 
-    if not text:
+    if not message_id:
+        return ''
 
+    value = message_id.strip()
+
+    # Remove < >
+    value = value.strip('<>')
+
+    # Everything before the final @ is the local part
+    if '@' in value:
+
+        value = value.rsplit(
+            '@',
+            1
+        )[0]
+
+    return value
+
+
+# ============================================================
+# EXTRACT POSSIBLE MESSAGE-ID PARTS
+#
+# IMPORTANT:
+# We do not assume "_" is the only selector.
+#
+# We first try common selector characters.
+#
+# Examples:
+#
+# A_B_C
+# A:B:C
+# A|B|C
+# A;B;C
+# A.B.C
+# A/B/C
+#
+# We also retain the complete value for direct checking.
+# ============================================================
+
+def split_message_id_parts(local_part):
+
+    if not local_part:
         return []
 
-    return re.findall(
-        r'[A-Za-z0-9+/_=-]{4,}',
-        text
+    parts = []
+
+    # --------------------------------------------------------
+    # Original complete value
+    # --------------------------------------------------------
+
+    parts.append(
+        local_part
+    )
+
+    # --------------------------------------------------------
+    # Common selectors
+    #
+    # "_" is included because your current Message-IDs
+    # use it heavily.
+    # --------------------------------------------------------
+
+    split_parts = re.split(
+        r'[_:|;,.\s/]+',
+        local_part
+    )
+
+    for part in split_parts:
+
+        part = part.strip()
+
+        if part:
+
+            parts.append(
+                part
+            )
+
+    # --------------------------------------------------------
+    # Remove duplicates while preserving order
+    # --------------------------------------------------------
+
+    return list(
+        dict.fromkeys(parts)
     )
 
 
 # ============================================================
-# FIND BLAST IDS INSIDE TEXT
+# FIND BLAST IDS IN DECODED TEXT
 # ============================================================
 
 def find_blast_ids_in_text(text):
 
     if not text:
-
         return []
 
     found = []
 
     # --------------------------------------------------------
-    # Search token-like sections
+    # 1. Direct Blast-ID matches
     # --------------------------------------------------------
 
-    tokens = extract_possible_tokens(
-        text
-    )
-
-    for token in tokens:
-
-        # Direct candidate
-        if is_blast_id(token):
-
-            value = token.lower()
-
-            if value not in found:
-
-                found.append(value)
-
-        # Decode candidate
-        decoded = safe_b64(
-            token
-        )
-
-        if decoded:
-
-            decoded = decoded.strip()
-
-            # Entire decoded value
-            if is_blast_id(decoded):
-
-                value = decoded.lower()
-
-                if value not in found:
-
-                    found.append(value)
-
-            # Blast ID might occur inside
-            # a larger decoded string
-            for match in re.findall(
-                r'(?<![A-Za-z0-9])'
-                r'[0-9][A-Za-z0-9]{11}'
-                r'(?![A-Za-z0-9])',
-                decoded
-            ):
-
-                value = match.lower()
-
-                if value not in found:
-
-                    found.append(value)
-
-    # --------------------------------------------------------
-    # Also scan complete text directly
-    # --------------------------------------------------------
-
-    for match in re.findall(
+    direct_matches = re.findall(
         r'(?<![A-Za-z0-9])'
         r'[0-9][A-Za-z0-9]{11}'
         r'(?![A-Za-z0-9])',
         text
-    ):
+    )
 
-        value = match.lower()
+    for value in direct_matches:
 
-        if value not in found:
+        value = value.lower()
 
-            found.append(value)
+        if is_blast_id(value):
+
+            if value not in found:
+
+                found.append(
+                    value
+                )
+
+    # --------------------------------------------------------
+    # 2. If decoded text itself is exactly a Blast ID
+    # --------------------------------------------------------
+
+    clean = text.strip()
+
+    if is_blast_id(clean):
+
+        clean = clean.lower()
+
+        if clean not in found:
+
+            found.append(
+                clean
+            )
 
     return found
 
 
 # ============================================================
-# EXTRACT BLAST ID FROM MESSAGE-ID
+# EXTRACT BLAST IDS FROM MESSAGE-ID
+#
+# This is the important new logic.
 # ============================================================
 
 def extract_blast_id(message_id):
@@ -430,68 +482,117 @@ def extract_blast_id(message_id):
 
     found = []
 
-    def add(value):
+    # --------------------------------------------------------
+    # Add helper
+    # --------------------------------------------------------
+
+    def add_blast(value):
 
         if not value:
-
             return
 
         value = value.strip()
 
-        # Direct complete Blast ID
+        # Direct candidate
         if is_blast_id(value):
 
             value = value.lower()
 
             if value not in found:
 
-                found.append(value)
+                found.append(
+                    value
+                )
 
-        # Search inside text
+        # Search inside a larger string
         for blast in find_blast_ids_in_text(
             value
         ):
 
             if blast not in found:
 
-                found.append(blast)
+                found.append(
+                    blast
+                )
 
     # --------------------------------------------------------
-    # 1. Inspect original Message-ID
+    # Get local part
     # --------------------------------------------------------
 
-    add(message_id)
-
-    # --------------------------------------------------------
-    # 2. Inspect ALL candidate tokens
-    #
-    # No assumption about "_" separator.
-    # --------------------------------------------------------
-
-    tokens = extract_possible_tokens(
+    local_part = get_message_id_local_part(
         message_id
     )
 
-    for token in tokens:
+    if not local_part:
 
-        # Direct candidate
-        add(token)
+        return '-'
 
+    # --------------------------------------------------------
+    # STEP 1
+    # Check the raw local part itself
+    # --------------------------------------------------------
+
+    add_blast(
+        local_part
+    )
+
+    # --------------------------------------------------------
+    # STEP 2
+    # Split using multiple possible selectors
+    # --------------------------------------------------------
+
+    parts = split_message_id_parts(
+        local_part
+    )
+
+    # --------------------------------------------------------
+    # STEP 3
+    # Decode every part independently
+    # --------------------------------------------------------
+
+    for part in parts:
+
+        # ----------------------------------------------------
+        # Direct check
+        # ----------------------------------------------------
+
+        add_blast(
+            part
+        )
+
+        # ----------------------------------------------------
         # Base64 decode
+        # ----------------------------------------------------
+
         decoded = safe_b64(
-            token
+            part
         )
 
         if decoded:
 
-            add(decoded)
-
-            # Decode another layer if necessary
-            nested_tokens = extract_possible_tokens(
+            add_blast(
                 decoded
             )
 
-            for nested in nested_tokens:
+            # ------------------------------------------------
+            # Some systems may have another encoded layer
+            # ------------------------------------------------
+
+            nested_parts = re.split(
+                r'[_:|;,.\s/]+',
+                decoded
+            )
+
+            for nested in nested_parts:
+
+                nested = nested.strip()
+
+                if not nested:
+                    continue
+
+                add_blast(
+                    nested
+                )
 
                 nested_decoded = safe_b64(
                     nested
@@ -499,50 +600,41 @@ def extract_blast_id(message_id):
 
                 if nested_decoded:
 
-                    add(
+                    add_blast(
                         nested_decoded
                     )
 
     # --------------------------------------------------------
-    # 3. Look at pieces separated by common delimiters
-    #
-    # This is supplementary; "_" is NOT required.
+    # STEP 4
+    # As an additional fallback, search the entire local
+    # part for anything that already resembles a Blast ID.
     # --------------------------------------------------------
 
-    pieces = re.split(
-        r'[^A-Za-z0-9+/_=-]+',
-        message_id
-    )
+    for blast in find_blast_ids_in_text(
+        local_part
+    ):
 
-    for piece in pieces:
+        if blast not in found:
 
-        if not piece:
-
-            continue
-
-        add(piece)
-
-        decoded = safe_b64(
-            piece
-        )
-
-        if decoded:
-
-            add(decoded)
+            found.append(
+                blast
+            )
 
     # --------------------------------------------------------
-    # Final result
+    # RESULT
     # --------------------------------------------------------
 
     if found:
 
-        return ', '.join(found)
+        return ', '.join(
+            found
+        )
 
     return '-'
 
 
 # ============================================================
-# EXTRACT DOMAIN
+# DOMAIN EXTRACTION
 # ============================================================
 
 def extract_domain(msg, headers):
@@ -564,7 +656,7 @@ def extract_domain(msg, headers):
         return m.group(1).lower()
 
     # --------------------------------------------------------
-    # 2. Return-Path fallback
+    # 2. Return-Path
     # --------------------------------------------------------
 
     rp = msg.get(
@@ -584,7 +676,7 @@ def extract_domain(msg, headers):
         return m.group(1).lower()
 
     # --------------------------------------------------------
-    # 3. From header fallback
+    # 3. From
     # --------------------------------------------------------
 
     frm = decode_mime_words(
@@ -620,7 +712,7 @@ def parse_email(msg, batch):
     )
 
     # --------------------------------------------------------
-    # Existing Sub-ID logic
+    # OLD SUB-ID
     # --------------------------------------------------------
 
     sid, typ = extract_subid(
@@ -628,7 +720,7 @@ def parse_email(msg, batch):
     )
 
     # --------------------------------------------------------
-    # Message-ID
+    # MESSAGE-ID
     # --------------------------------------------------------
 
     message_id = decode_mime_words(
@@ -639,7 +731,7 @@ def parse_email(msg, batch):
     )
 
     # --------------------------------------------------------
-    # Blast ID
+    # BLAST ID
     # --------------------------------------------------------
 
     blast_id = extract_blast_id(
@@ -647,10 +739,10 @@ def parse_email(msg, batch):
     )
 
     # --------------------------------------------------------
-    # Choose one identifier
+    # DYNAMIC IDENTIFIER
     #
-    # Sub ID has priority.
-    # Otherwise use Blast ID.
+    # Sub ID gets priority.
+    # If there is no Sub ID, use Blast ID.
     # --------------------------------------------------------
 
     if sid != '-':
@@ -715,7 +807,7 @@ def parse_email(msg, batch):
     }
 
     # --------------------------------------------------------
-    # Authentication Results
+    # AUTH RESULTS
     # --------------------------------------------------------
 
     for key in (
@@ -765,7 +857,7 @@ def get_identifier_column_name(df):
         return 'Blast/Sub ID'
 
     # --------------------------------------------------------
-    # Identify Sub IDs
+    # Detect whether an identifier is an old Sub ID
     # --------------------------------------------------------
 
     subid_mask = values.str.match(
@@ -848,7 +940,7 @@ def fetch_box(
     )
 
     # --------------------------------------------------------
-    # Incremental Inbox fetch
+    # Incremental Inbox
     # --------------------------------------------------------
 
     if (
@@ -905,7 +997,7 @@ def fetch_box(
                 rows.append(r)
 
         # ----------------------------------------------------
-        # Track latest Inbox UID
+        # Latest Inbox UID
         # ----------------------------------------------------
 
         if mailbox == 'inbox':
@@ -1211,8 +1303,9 @@ if not st.session_state.df.empty:
     ]
 
     display_df = (
-        st.session_state.df[cols]
-        .copy()
+        st.session_state.df[
+            cols
+        ].copy()
     )
 
     identifier_name = (
